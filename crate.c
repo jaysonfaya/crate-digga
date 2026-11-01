@@ -1,4 +1,4 @@
-/* CRATE DIGGA 1.4 (JJ DA PLUG): an MPC OS VST2 plugin (instrument) that digs for free sounds on the internet.
+/* CRATE DIGGA 1.5 (JJ DA PLUG): an MPC OS VST2 plugin (instrument) that digs for free sounds on the internet.
  * Made by JJ-LEMMING.
  *
  * It searches Openverse (https://openverse.org) for audio that is CC0 or Public Domain only: nothing else is ever requested
@@ -76,7 +76,7 @@ static struct {
     int refs, boot;
     char base[200];
     char q[32]; int cat, shortonly;
-    res_t res[NRES]; int nres, rpage, rsel, apage, hidden, src;
+    res_t res[NRES]; int nres, rpage, rsel, apage, hidden, src, picks, pseed;
     char status[120]; double status_t;
     atomic_int busy;
     int16_t *pv; int pv_frames; int pv_play; unsigned pv_gen; int pv_valid, pv_kept;
@@ -88,12 +88,12 @@ static struct {
     int curl_state; char netinfo[160]; unsigned rev;
     struct { unsigned char att, dec, rel, grp, mode; } pc[NPADS];   /* per pad: attack, decay, release (steps), mute group 0-8, mode 0 one-shot / 1 hold */
     int last_note, last_pad, acc_state;   /* acc_state: 0 no account, 1 waiting for the e-mail link, 2 ready */
-    atomic_int verifying;
+    atomic_int verifying, quit, workers;
     char email[64], cid[80], csec[80], tok[700]; double tok_exp;     /* the Openverse account */
 } G = { .mu = PTHREAD_MUTEX_INITIALIZER, .padmu = PTHREAD_MUTEX_INITIALIZER, .netmu = PTHREAD_MUTEX_INITIALIZER, .rsel = -1, .csel = -1, .apage = 1, .shortonly = 1, .last_note = -1, .last_pad = -1 };
 
 /* the turntable: pitch fader, range, key lock, scratch slider, platter picture (frame number of the filmstrip) */
-#define NPLAT 48
+#define NPLAT 24
 typedef struct { atomic_int pitch, prange, klock, jogv, jogref, jogstart, joglast, plat; atomic_llong jogt; } deck_t;
 static const int RANGE_PCT[3] = { 8, 16, 50 };
 static double deck_speed(deck_t *dk) { return 1.0 + (atomic_load(&dk->pitch) - 500) / 500.0 * RANGE_PCT[atomic_load(&dk->prange) % 3] / 100.0; }
@@ -122,6 +122,7 @@ static void make_dirs(void) {
 /* ---------- HTTPS: the MPC's own libcurl, loaded when first needed; without it the system's curl or wget program ---------- */
 
 typedef struct { uint8_t *d; size_t n, cap, max; int over; } buf_t;
+static int prog_cb(void *u, long long a, long long b, long long c, long long d);
 
 static struct {
     void *h;
@@ -163,7 +164,12 @@ static int curl_load(void) {
 static size_t wcb(void *p, size_t sz, size_t nm, void *u) {
     buf_t *b = u;
     size_t n = sz * nm;
-    if (b->n + n > b->max) { b->over = 1; return 0; }
+    if (b->n + n > b->max) {   /* too much: keep what fits (a cut-off MP3 still plays), then stop the transfer */
+        size_t room = b->max > b->n ? b->max - b->n : 0;
+        if (room && b->n + room + 1 > b->cap) { uint8_t *t = realloc(b->d, b->n + room + 1); if (t) { b->d = t; b->cap = b->n + room + 1; } else room = 0; }
+        if (room) { memcpy(b->d + b->n, p, room); b->n += room; b->d[b->n] = 0; }
+        b->over = 1; return 0;
+    }
     if (b->n + n + 1 > b->cap) {
         size_t nc = b->cap ? b->cap : 65536;
         while (nc < b->n + n + 1) nc *= 2;
@@ -177,7 +183,8 @@ static size_t wcb(void *p, size_t sz, size_t nm, void *u) {
     return n;
 }
 
-typedef struct { const char *post, *bearer; } req_t;
+typedef struct { const char *post, *bearer, *range; } req_t;
+static int prog_cb(void *u, long long a, long long b, long long c, long long d) { (void)u; (void)a; (void)b; (void)c; (void)d; return atomic_load(&G.quit); }
 
 static int http_curl(const req_t *rq, const char *url, buf_t *b, long timeout, char *err, size_t ecap, long *code) {
     void *h = CURL.init();
@@ -189,7 +196,10 @@ static int http_curl(const req_t *rq, const char *url, buf_t *b, long timeout, c
     CURL.setopt(h, 52, 1L);                           /* FOLLOWLOCATION */
     CURL.setopt(h, 68, 5L);                           /* MAXREDIRS */
     CURL.setopt(h, 13, timeout);                      /* TIMEOUT */
-    CURL.setopt(h, 78, 7L);                          /* CONNECTTIMEOUT */
+    CURL.setopt(h, 78, 4L);                          /* CONNECTTIMEOUT: give up quickly */
+    CURL.setopt(h, 19, 1000L); CURL.setopt(h, 20, 8L);   /* LOW_SPEED_LIMIT / TIME: a stalled transfer ends after 8 s */
+    CURL.setopt(h, 43, 0L); CURL.setopt(h, 20219, prog_cb); CURL.setopt(h, 10057, NULL);   /* the progress hook lets a transfer stop at once when the plugin is removed */
+    if (rq && rq->range) CURL.setopt(h, 10007, rq->range);   /* RANGE */
     CURL.setopt(h, 10018, "CrateDigga/0.1 (JJ DA PLUG; MPC)");   /* USERAGENT */
     CURL.setopt(h, 99, 1L);                           /* NOSIGNAL */
     CURL.setopt(h, 10102, "");                        /* ACCEPT_ENCODING: whatever curl supports */
@@ -208,14 +218,15 @@ static int http_curl(const req_t *rq, const char *url, buf_t *b, long timeout, c
     CURL.cleanup(h);
     if (hdr) CURL.slist_free(hdr);
     *code = c;
-    if (rc != 0) { snprintf(err, ecap, "%s", b->over ? "File too big" : CURL.strerr(rc)); return -1; }
+    if (rc != 0 && b->over && b->n && rq && rq->range) return 0;   /* a server that ignored the range: the first part is enough */
+    if (rc != 0) { snprintf(err, ecap, "%s", atomic_load(&G.quit) ? "Stopped" : b->over ? "File too big" : CURL.strerr(rc)); return -1; }
     return 0;
 }
 
 static int http_spawn(const req_t *rq, const char *url, buf_t *b, long timeout, char *err, size_t ecap, long *code) {
     char tmp[80], tm[16], mx[24];
     snprintf(tmp, sizeof tmp, "/tmp/crate_%d_%ld.dl", (int)getpid(), (long)time(NULL));
-    snprintf(tm, sizeof tm, "%ld", timeout);
+    snprintf(tm, sizeof tm, "%ld", timeout > 20 ? 20 : timeout);
     snprintf(mx, sizeof mx, "%zu", b->max);
     static const char *const curls[] = { "/usr/bin/curl", "/bin/curl", "/usr/local/bin/curl", NULL };
     static const char *const wgets[] = { "/usr/bin/wget", "/bin/wget", "/usr/local/bin/wget", NULL };
@@ -540,13 +551,25 @@ static void pv_install(int16_t *d, int frames, const char *name, const char *lic
 
 /* ---------- jobs on worker threads ---------- */
 
+typedef struct { void *(*fn)(void *); void *arg; } wjob_t;
+static void *worker_main(void *a) {
+    wjob_t j = *(wjob_t *)a;
+    free(a);
+    j.fn(j.arg);
+    atomic_fetch_sub(&G.workers, 1);
+    return NULL;
+}
 static void spawn_job(void *(*fn)(void *), void *arg) {
     pthread_t t;
     pthread_attr_t at;
+    wjob_t *w = malloc(sizeof *w);
+    if (!w || atomic_load(&G.quit)) { free(w); free(arg); atomic_store(&G.busy, 0); return; }
+    w->fn = fn; w->arg = arg;
     pthread_attr_init(&at);
     pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
     pthread_attr_setstacksize(&at, 512 * 1024);
-    if (pthread_create(&t, &at, fn, arg)) { free(arg); atomic_store(&G.busy, 0); status_set("Cannot start a worker"); }
+    atomic_fetch_add(&G.workers, 1);
+    if (pthread_create(&t, &at, worker_main, w)) { atomic_fetch_sub(&G.workers, 1); free(w); free(arg); atomic_store(&G.busy, 0); status_set("Cannot start a worker"); }
     pthread_attr_destroy(&at);
 }
 
@@ -593,10 +616,10 @@ static void bearer_get(char *out, size_t cap) {
     urlenc(id, ide, sizeof ide); urlenc(sec, sece, sizeof sece);
     snprintf(url, sizeof url, "%sauth_tokens/token/", api_root());
     snprintf(post, sizeof post, "grant_type=client_credentials&client_id=%s&client_secret=%s", ide, sece);
-    req_t rq = { post, NULL };
+    req_t rq = { post, NULL, NULL };
     buf_t b;
     long code;
-    if (http_req(&rq, url, &b, 1 << 16, 20, err, sizeof err, &code) == 0 && b.d) {
+    if (http_req(&rq, url, &b, 1 << 16, 8, err, sizeof err, &code) == 0 && b.d) {
         char tk[700];
         val_str(obj_get((const char *)b.d, "access_token"), tk, sizeof tk);
         double ex = val_num(obj_get((const char *)b.d, "expires_in"));
@@ -632,10 +655,10 @@ static int wiki_search(const char *qe, int apage, int shortonly, res_t *tmp, int
     snprintf(url, sizeof url, "%s?action=query&format=json&formatversion=2&generator=search&gsrnamespace=6&gsrsearch=%s%%20filetype%%3Aaudio&gsrlimit=50&gsroffset=%d"
              "&prop=imageinfo&iiprop=url%%7Cmime%%7Csize%%7Cextmetadata&iiextmetadatafilter=LicenseShortName%%7CArtist",
              wiki_root(), qe, (apage - 1) * 50);
-    req_t rq = { NULL, NULL };
+    req_t rq = { NULL, NULL, NULL };
     buf_t b = {0};
     long code = 0;
-    if (http_req(&rq, url, &b, 4 << 20, 25, err, ecap, &code)) { free(b.d); return -1; }
+    if (http_req(&rq, url, &b, 4 << 20, 9, err, ecap, &code)) { free(b.d); return -1; }
     int n = 0;
     const char *q = b.d ? obj_get((const char *)b.d, "query") : NULL;
     const char *arr = q ? obj_get(q, "pages") : NULL;
@@ -688,43 +711,133 @@ static int wiki_search(const char *qe, int apage, int shortonly, res_t *tmp, int
     return n;
 }
 
-typedef struct { int apage; } sjob_t;
+/* ---------- the three sources: Internet Archive (film music, cartoons, radio), Wikimedia Commons, Openverse ---------- */
 
-static void *job_search(void *arg) {
-    int apage = ((sjob_t *)arg)->apage;
-    free(arg);
-    char q[40], qe[120], url[600], err[100] = "";
-    int cat, shortonly;
-    LOCK(); snprintf(q, sizeof q, "%s", G.q); cat = G.cat; shortonly = G.shortonly; UNLOCK();
-    urlenc(q, qe, sizeof qe);
-    snprintf(url, sizeof url, "%saudio/?q=%s&license=cc0,pdm&page_size=%d&page=%d&mature=false%s", api_root(),
-             qe, NRES, apage, cat == 1 ? "&category=sound_effect" : cat == 2 ? "&category=music" : "");
-    status_set("Searching...");
-    char bearer[720];
-    bearer_get(bearer, sizeof bearer);
-    req_t rq = { NULL, bearer };
+static void val_str_any(const char *v, char *out, size_t cap) { if (v && *v == '[') v = skip_ws(v + 1); val_str(v, out, cap); }
+static const char *ia_root(void) { const char *e = getenv("CRATE_IA"); return e && *e ? e : "https://archive.org/"; }
+
+/* q: a few plain words, or "" for free picks. returns the number of sounds, or -1 */
+static int ia_search(const char *q, int apage, res_t *tmp, char *err, size_t ecap) {
+    char qq[300] = "mediatype:audio AND licenseurl:(*publicdomain*)", qe[900], url[1200];
+    int words = 0;
+    for (const char *p = q; *p && words < 4;) {
+        while (*p == ' ') p++;
+        char w[40]; int k = 0;
+        while (*p && *p != ' ' && k < 30) { if (isalnum((unsigned char)*p)) w[k++] = *p; p++; }
+        while (*p && *p != ' ') p++;
+        w[k] = 0;
+        if (k) { size_t l = strlen(qq); snprintf(qq + l, sizeof qq - l, " AND (%s)", w); words++; }
+    }
+    urlenc(qq, qe, sizeof qe);
+    int page = apage;
+    if (!words) { LOCK(); page = (G.pseed + apage) % 40 + 1; UNLOCK(); }
+    snprintf(url, sizeof url, "%sadvancedsearch.php?q=%s&fl%%5B%%5D=identifier&fl%%5B%%5D=title&fl%%5B%%5D=creator&fl%%5B%%5D=licenseurl&sort%%5B%%5D=downloads+desc&rows=%d&page=%d&output=json",
+             ia_root(), qe, NRES, page);
+    req_t rq = { NULL, NULL, NULL };
     buf_t b = {0};
     long code = 0;
-    int use_wiki = 0;
-    LOCK(); if (apage > 1 && G.src == 1) use_wiki = 1; UNLOCK();
-    res_t *tmp = calloc(NRES, sizeof *tmp);
-    int n = 0, hidden = 0;
-    if (!tmp) { status_set("Out of memory"); atomic_store(&G.busy, 0); return NULL; }
-    long ovcode = 0;
-    int ovbad = !use_wiki && http_req(&rq, url, &b, 4 << 20, 25, err, sizeof err, &code);
-    if (ovbad && code == 401 && bearer[0]) {   /* a key that is not valid (yet): forget the token and ask without it */
-        free(b.d); b.d = NULL;
+    if (http_req(&rq, url, &b, 1 << 20, 9, err, ecap, &code)) { free(b.d); return -1; }
+    int n = 0;
+    const char *rs = b.d ? obj_get((const char *)b.d, "response") : NULL;
+    const char *arr = rs ? obj_get(rs, "docs") : NULL;
+    if (arr && *(arr = skip_ws(arr)) == '[') {
+        const char *p = arr + 1;
+        while (n < NRES) {
+            p = skip_ws(p);
+            if (*p == ',') { p++; continue; }
+            if (*p != '{') break;
+            const char *end = skip_val(p);
+            if (!end) break;
+            char id[100], lu[160];
+            val_str_any(obj_get(p, "identifier"), id, sizeof id);
+            val_str_any(obj_get(p, "licenseurl"), lu, sizeof lu);
+            int zero = strstr(lu, "publicdomain/zero") != NULL, pd = strstr(lu, "publicdomain") != NULL;
+            int idok = id[0] != 0;
+            for (const char *c = id; *c; c++) if (!(isalnum((unsigned char)*c) || *c == '_' || *c == '-' || *c == '.')) idok = 0;
+            if (pd && idok) {
+                res_t *r = &tmp[n];
+                val_str_any(obj_get(p, "title"), r->title, sizeof r->title);
+                val_str_any(obj_get(p, "creator"), r->creator, sizeof r->creator);
+                if (!r->title[0]) snprintf(r->title, sizeof r->title, "%s", id);
+                if (!r->creator[0]) snprintf(r->creator, sizeof r->creator, "unknown");
+                snprintf(r->license, sizeof r->license, "%s", zero ? "CC0" : "PDM");
+                snprintf(r->url, sizeof r->url, "https://archive.org/details/%s", id);
+                snprintf(r->ext, sizeof r->ext, "mp3");
+                r->dur = 0;
+                n++;
+            }
+            p = end;
+        }
+    }
+    free(b.d);
+    return n;
+}
+
+/* a file of an Internet Archive item that we can play: mp3 first, small ogg/wav otherwise. out = the download address */
+static int ia_resolve(const char *id, char *out, size_t cap, char *err, size_t ecap) {
+    char url[300];
+    snprintf(url, sizeof url, "%smetadata/%s/files", ia_root(), id);
+    req_t rq = { NULL, NULL, NULL };
+    buf_t b = {0};
+    long code = 0;
+    if (http_req(&rq, url, &b, 3 << 20, 9, err, ecap, &code)) { free(b.d); return -1; }
+    const char *arr = b.d ? obj_get((const char *)b.d, "result") : NULL;
+    if (!arr) arr = b.d ? obj_get((const char *)b.d, "files") : NULL;
+    char best[300] = "", bestprio[1] = {0};
+    int prio = 0;
+    (void)bestprio;
+    if (arr && *(arr = skip_ws(arr)) == '[') {
+        const char *p = arr + 1;
+        for (int guard = 0; guard < 400; guard++) {
+            p = skip_ws(p);
+            if (*p == ',') { p++; continue; }
+            if (*p != '{') break;
+            const char *end = skip_val(p);
+            if (!end) break;
+            char nm[300], sz[24];
+            val_str(obj_get(p, "name"), nm, sizeof nm);
+            val_str_any(obj_get(p, "size"), sz, sizeof sz);
+            long long size = atoll(sz);
+            size_t l = strlen(nm);
+            const char *ex = l > 4 ? nm + l - 4 : "";
+            int pr = 0;
+            if (!strcasecmp(ex, ".mp3") && size > 30000) pr = 3;
+            else if (!strcasecmp(ex, ".ogg") && size > 20000 && size < 2500000) pr = 2;
+            else if (!strcasecmp(ex, ".wav") && size > 20000 && size < 2500000) pr = 1;
+            if (pr > prio && nm[0] != '/' && !strstr(nm, "..")) { prio = pr; snprintf(best, sizeof best, "%s", nm); if (pr == 3) break; }
+            p = end;
+        }
+    }
+    free(b.d);
+    if (!best[0]) { snprintf(err, ecap, "No playable file in this item"); return -1; }
+    char enc[900]; size_t o = 0;
+    for (const char *c = best; *c && o + 4 < sizeof enc; c++) {
+        if (isalnum((unsigned char)*c) || strchr("-_.~/", *c)) enc[o++] = *c;
+        else o += (size_t)snprintf(enc + o, 4, "%%%02X", (unsigned char)*c);
+    }
+    enc[o] = 0;
+    snprintf(out, cap, "%sdownload/%s/%s", ia_root(), id, enc);
+    return 0;
+}
+
+static int ov_search(const char *qe, int apage, int cat, res_t *tmp, char *err, size_t ecap) {
+    char url[600], bearer[720];
+    snprintf(url, sizeof url, "%saudio/?q=%s&license=cc0,pdm&page_size=%d&page=%d&mature=false%s", api_root(),
+             qe, NRES, apage, cat == 1 ? "&category=sound_effect" : cat == 2 ? "&category=music" : "");
+    bearer_get(bearer, sizeof bearer);
+    req_t rq = { NULL, bearer, NULL };
+    buf_t b = {0};
+    long code = 0;
+    int bad = http_req(&rq, url, &b, 4 << 20, 9, err, ecap, &code);
+    if (bad && code == 401 && bearer[0]) {   /* a key that is not valid (yet): forget it and ask without */
+        free(b.d);
         LOCK(); G.tok[0] = 0; UNLOCK();
-        req_t rq2 = { NULL, NULL };
-        ovbad = http_req(&rq2, url, &b, 4 << 20, 25, err, sizeof err, &code);
+        req_t rq2 = { NULL, NULL, NULL };
+        bad = http_req(&rq2, url, &b, 4 << 20, 9, err, ecap, &code);
     }
-    ovcode = code;
-    if (ovbad) {
-        free(b.d); b.d = NULL;
-        if (apage == 1) use_wiki = 1;
-        else { char m[160]; snprintf(m, sizeof m, "Search failed: %.100s", err); status_set(m); free(tmp); atomic_store(&G.busy, 0); return NULL; }
-    }
-    const char *arr = (!use_wiki && b.d) ? obj_get((const char *)b.d, "results") : NULL;
+    if (bad) { free(b.d); return -1; }
+    int n = 0;
+    const char *arr = b.d ? obj_get((const char *)b.d, "results") : NULL;
     if (arr && *(arr = skip_ws(arr)) == '[') {
         const char *p = arr + 1;
         while (n < NRES) {
@@ -739,42 +852,74 @@ static void *job_search(void *arg) {
             val_str(obj_get(p, "license"), lic, sizeof lic);
             val_str(obj_get(p, "filetype"), ext, sizeof ext);
             double ms = val_num(obj_get(p, "duration"));
-            if (lic_ok(lic) && ext_ok(ext) && (!strncmp(url2, "https://", 8) || !strncmp(url2, "http://", 7))) {
-                if (shortonly && ms > 60000) hidden++;
-                else {
-                    val_str(obj_get(p, "title"), r->title, sizeof r->title);
-                    val_str(obj_get(p, "creator"), r->creator, sizeof r->creator);
-                    snprintf(r->license, sizeof r->license, "%s", !strcasecmp(lic, "cc0") ? "CC0" : "PDM");
-                    snprintf(r->url, sizeof r->url, "%s", url2);
-                    snprintf(r->ext, sizeof r->ext, "%s", ext);
-                    r->dur = (int)(ms / 1000.0 + 0.5);
-                    if (!r->title[0]) snprintf(r->title, sizeof r->title, "(no title)");
-                    n++;
-                }
-            } else if (!lic_ok(lic) && lic[0]) hidden++;
+            if (lic_ok(lic) && ext_ok(ext) && !strncmp(url2, "https://", 8) && ms <= 90000) {
+                val_str(obj_get(p, "title"), r->title, sizeof r->title);
+                val_str(obj_get(p, "creator"), r->creator, sizeof r->creator);
+                snprintf(r->license, sizeof r->license, "%s", !strcasecmp(lic, "cc0") ? "CC0" : "PDM");
+                snprintf(r->url, sizeof r->url, "%s", url2);
+                snprintf(r->ext, sizeof r->ext, "%s", ext);
+                r->dur = (int)(ms / 1000.0 + 0.5);
+                if (!r->title[0]) snprintf(r->title, sizeof r->title, "(no title)");
+                n++;
+            }
             p = end;
         }
     }
     free(b.d);
-    if (!use_wiki && n == 0 && apage == 1) use_wiki = 1;
-    if (use_wiki) {
-        n = 0; hidden = 0; memset(tmp, 0, sizeof(res_t) * NRES);
-        n = wiki_search(qe, apage, shortonly, tmp, &hidden, err, sizeof err);
-        if (n < 0) {
-            char m[160];
-            snprintf(m, sizeof m, "No luck. Openverse %ld, Wikimedia: %.60s", ovcode, err[0] ? err : "no connection");
-            status_set(m); free(tmp); atomic_store(&G.busy, 0); return NULL;
-        }
+    return n;
+}
+
+typedef struct { int apage; } sjob_t;
+static int no_net(const char *e) { return strstr(e, "resolve") || strstr(e, "onnect") || strstr(e, "Stopped"); }
+
+/* one search: Internet Archive first, then Wikimedia Commons, then Openverse (only with an account). Nothing found: free picks, so there is always something. */
+static void *job_search(void *arg) {
+    int apage = ((sjob_t *)arg)->apage;
+    free(arg);
+    char q[40], qe[120], err[100] = "", m[160];
+    int cat, shortonly;
+    LOCK(); snprintf(q, sizeof q, "%s", G.q); cat = G.cat; shortonly = G.shortonly; UNLOCK();
+    for (char *c = q + strlen(q); c > q && c[-1] == ' '; ) *--c = 0;
+    urlenc(q, qe, sizeof qe);
+    status_set("Searching...");
+    res_t *tmp = calloc(NRES, sizeof *tmp);
+    if (!tmp) { status_set("Out of memory"); atomic_store(&G.busy, 0); return NULL; }
+    int n = 0, hidden = 0, src = 2, picks = 0, offline = 0, tried_err = 0;
+    int has_acc;
+    LOCK(); has_acc = G.cid[0] != 0; if (apage > 1) { src = G.src; picks = G.picks; } else G.pseed = (int)(time(NULL) / 5) % 40; UNLOCK();
+    if (apage == 1 && !q[0]) picks = 1;
+    int order[3], no = 0;
+    if (apage > 1) order[no++] = src;
+    else { order[no++] = 2; order[no++] = 1; if (has_acc) order[no++] = 0; }
+    for (int k = 0; k < no && !offline; k++) {
+        int sc = order[k];
+        memset(tmp, 0, sizeof(res_t) * NRES); hidden = 0;
+        if (sc == 2) n = ia_search(picks ? "" : q, apage, tmp, err, sizeof err);
+        else if (sc == 1) n = wiki_search(picks ? "music" : qe, apage, shortonly, tmp, &hidden, err, sizeof err);
+        else n = picks ? 0 : ov_search(qe, apage, cat, tmp, err, sizeof err);
+        if (n < 0) { tried_err = 1; if (no_net(err)) offline = 1; }
+        if (n > 0) { src = sc; break; }
+    }
+    if (n <= 0 && !offline && apage == 1 && !picks) {   /* nothing for this word: free picks instead */
+        memset(tmp, 0, sizeof(res_t) * NRES); hidden = 0;
+        n = ia_search("", 1, tmp, err, sizeof err);
+        if (n < 0 && no_net(err)) offline = 1;
+        if (n > 0) { picks = 2; src = 2; }
+    }
+    if (n < 0) n = 0;
+    if (n == 0) {
+        if (offline) snprintf(m, sizeof m, "No internet: check the MPC's network. (%.50s)", err);
+        else if (apage > 1) snprintf(m, sizeof m, "No more results");
+        else snprintf(m, sizeof m, tried_err ? "Search failed: %.100s" : "Nothing found", err);
+        status_set(m); free(tmp); atomic_store(&G.busy, 0); return NULL;
     }
     LOCK();
-    G.src = use_wiki ? 1 : 0;
+    G.src = src; G.picks = picks ? 1 : 0;
     memcpy(G.res, tmp, sizeof(res_t) * NRES);
     G.nres = n; G.rpage = 0; G.rsel = -1; G.apage = apage; G.hidden = hidden; G.rev++;
     UNLOCK();
     free(tmp);
-    char m[120];
-    if (n) snprintf(m, sizeof m, "%d sounds (page %d)%s%s", n, apage, hidden ? ", some hidden" : "", use_wiki ? "  [Wikimedia]" : "");
-    else snprintf(m, sizeof m, apage > 1 ? "No more results" : "Nothing found");
+    snprintf(m, sizeof m, "%s%d sounds (page %d)  [%s]", picks == 2 ? "Nothing for that word. Free picks: " : picks == 1 ? "Free picks: " : "", n, apage, src == 2 ? "Archive" : src == 1 ? "Wikimedia" : "Openverse");
     status_set(m);
     atomic_store(&G.busy, 0);
     return NULL;
@@ -788,7 +933,17 @@ static void *job_preview(void *arg) {
     buf_t b;
     long code;
     status_set("Loading sound...");
-    if (http_get(j->url, &b, MAX_DL, 60, err, sizeof err, &code)) {
+    char real[900];
+    snprintf(real, sizeof real, "%s", j->url);
+    int ia = !strncmp(j->url, "https://archive.org/details/", 28);
+    int bad = 0;
+    if (ia) bad = ia_resolve(j->url + 28, real, sizeof real, err, sizeof err);
+    if (!bad && ia) {   /* only the first part of the file: enough for a sample, light on memory */
+        req_t rq = { NULL, NULL, "0-1499999" };
+        bad = http_req(&rq, real, &b, 1600000, 25, err, sizeof err, &code);
+        if (bad) { free(b.d); b.d = NULL; }
+    } else if (!bad) bad = http_get(real, &b, MAX_DL, 25, err, sizeof err, &code);
+    if (bad) {
         char m[160];
         snprintf(m, sizeof m, "Load failed: %.100s", err);
         status_set(m);
@@ -884,7 +1039,7 @@ static void *job_keep(void *arg) {
         char tp[430];
         snprintf(tp, sizeof tp, "%.*s.txt", (int)strlen(path) - 4, path);
         FILE *f = fopen(tp, "w");
-        if (f) { fprintf(f, "Title: %s\nCreator: %s\nLicense: %s\nSource: %s\nFound with: Openverse (openverse.org)\n", name, creator, !strcmp(lic, "CC0") ? "CC0 1.0 (public domain dedication)" : "Public Domain Mark", url); fclose(f); }
+        if (f) { fprintf(f, "Title: %s\nCreator: %s\nLicense: %s\nSource: %s\nFound with: Crate Digga (Internet Archive, Wikimedia Commons or Openverse)\n", name, creator, !strcmp(lic, "CC0") ? "CC0 1.0 (public domain dedication)" : "Public Domain Mark", url); fclose(f); }
         LOCK(); G.pv_kept = 1; UNLOCK();
         note_set("Kept in your CRATE");
         crate_scan();
@@ -942,7 +1097,7 @@ static void *job_test(void *arg) {
     int has = curl_load();
     bearer_get(bearer, sizeof bearer);
     snprintf(url, sizeof url, "%srate_limit/", api_root());
-    req_t rq = { NULL, bearer };
+    req_t rq = { NULL, bearer, NULL };
     int rc = http_req(&rq, url, &b, 1 << 16, 25, err, sizeof err, &code);
     char info[160];
     if (rc && code == 429) snprintf(info, sizeof info, "%s: online, but Openverse says too many requests", has ? "libcurl" : "curl/wget");
@@ -965,32 +1120,27 @@ static void *job_test(void *arg) {
     return NULL;
 }
 
-/* after REGISTER (and at every start with an account that is not confirmed yet): ask Openverse every 6 seconds whether the e-mail link was tapped,
- * so there is nothing to press: the status turns to "Account ready" by itself */
+/* one single question to Openverse: is the e-mail link tapped yet? (no waiting loop, nothing runs in the background) */
 static void *job_verify(void *arg) {
     (void)arg;
-    if (atomic_exchange(&G.verifying, 1)) return NULL;
-    for (int tries = 0; tries < 400; tries++) {
-        char bearer[720], url[300], err[100];
-        buf_t b; long code = 0;
-        LOCK(); G.tok[0] = 0; UNLOCK();
-        bearer_get(bearer, sizeof bearer);
-        int ok = 0;
-        if (bearer[0]) {
-            snprintf(url, sizeof url, "%srate_limit/", api_root());
-            req_t rq = { NULL, bearer };
-            if (http_req(&rq, url, &b, 1 << 16, 10, err, sizeof err, &code) == 0) {
-                const char *vf = b.d ? obj_get((const char *)b.d, "verified") : NULL;
-                ok = vf && !strncmp(vf, "true", 4);
-                free(b.d);
-            }
+    char bearer[720], url[300], err[100] = "";
+    buf_t b = {0}; long code = 0;
+    int ok = 0;
+    LOCK(); G.tok[0] = 0; UNLOCK();
+    status_set("Checking...");
+    bearer_get(bearer, sizeof bearer);
+    if (bearer[0]) {
+        snprintf(url, sizeof url, "%srate_limit/", api_root());
+        req_t rq = { NULL, bearer, NULL };
+        if (http_req(&rq, url, &b, 1 << 16, 8, err, sizeof err, &code) == 0) {
+            const char *vf = b.d ? obj_get((const char *)b.d, "verified") : NULL;
+            ok = vf && !strncmp(vf, "true", 4);
         }
-        LOCK(); G.acc_state = ok ? 2 : 1; G.rev++; UNLOCK();
-        if (ok) { status_set("Account ready: searching is open now"); break; }
-        { char wm[120]; snprintf(wm, sizeof wm, bearer[0] ? "Waiting for your e-mail link (check %d, code %ld)" : "Waiting for your e-mail link (check %d, no key yet)", tries + 1, code); status_set(wm); }
-        for (int k = 0; k < 6; k++) { sleep(1); LOCK(); int gone = !G.cid[0]; UNLOCK(); if (gone) { atomic_store(&G.verifying, 0); return NULL; } }
+        free(b.d);
     }
-    atomic_store(&G.verifying, 0);
+    LOCK(); G.acc_state = ok ? 2 : 1; G.rev++; UNLOCK();
+    status_set(ok ? "Account ready" : "Not confirmed yet: tap the mail link, then press CHECK");
+    atomic_store(&G.busy, 0);
     return NULL;
 }
 
@@ -1006,7 +1156,7 @@ static void *job_register(void *arg) {
     urlenc(email, ee, sizeof ee);
     snprintf(url, sizeof url, "%sauth_tokens/register/", api_root());
     snprintf(post, sizeof post, "name=%s&description=Personal+tool+on+an+MPC+to+find+CC0+and+public+domain+sounds&email=%s", nm, ee);
-    req_t rq = { post, NULL };
+    req_t rq = { post, NULL, NULL };
     buf_t b;
     long code;
     status_set("Registering...");
@@ -1023,7 +1173,7 @@ static void *job_register(void *arg) {
             if (ok) { char line[200]; int n = snprintf(line, sizeof line, "%s\n%s\n", id, sec); ok = write(fd, line, (size_t)n) == n; close(fd); }
             if (ok) {
                 LOCK(); snprintf(G.cid, sizeof G.cid, "%s", id); snprintf(G.csec, sizeof G.csec, "%s", sec); G.tok[0] = 0; UNLOCK();
-                snprintf(m, sizeof m, "Done. Now tap the link in the e-mail from Openverse. This screen notices it by itself");
+                snprintf(m, sizeof m, "Done. Tap the link in the e-mail from Openverse, then press CHECK");
                 LOCK(); G.acc_state = 1; UNLOCK();
             } else snprintf(m, sizeof m, "Registered, but the key could not be saved");
         } else snprintf(m, sizeof m, "Unexpected answer from Openverse");
@@ -1033,8 +1183,6 @@ static void *job_register(void *arg) {
     free(b.d);
     status_set(m);
     atomic_store(&G.busy, 0);
-    LOCK(); int started = G.acc_state == 1; UNLOCK();
-    if (started) job_verify(NULL);
     return NULL;
 }
 
@@ -1079,15 +1227,7 @@ static void cfg_save(void) {
     if (fclose(f) == 0) rename(tmp, path); else unlink(tmp);
 }
 static void *cfg_save_thread(void *a) { (void)a; cfg_save(); return NULL; }
-static void cfg_save_async(void) {
-    pthread_t t;
-    pthread_attr_t at;
-    pthread_attr_init(&at);
-    pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
-    pthread_attr_setstacksize(&at, 128 * 1024);
-    pthread_create(&t, &at, cfg_save_thread, NULL);
-    pthread_attr_destroy(&at);
-}
+static void cfg_save_async(void) { spawn_job(cfg_save_thread, NULL); }
 static void map_default(void) {
     memset(G.padmap, -1, sizeof G.padmap);
     for (int k = 0; k < 16; k++) { G.padmap[k] = (signed char)k; G.padmap[36 + k] = (signed char)k; }
@@ -1178,6 +1318,7 @@ typedef struct {
     struct { int on; long pos; float gain; long age, rage; } voice[NPADS];   /* rage < 0: not releasing */
     deck_t dk;
     int plat_rep;
+    double plat_t;
     unsigned seen_gen; double pv_posf; long pv_fade;
     double ang, anchor; int scr, hopc; struct { double src; int age; } gr[5]; int ngr;
     int was_playing;
@@ -1190,21 +1331,16 @@ static void *create(const char *dir) {
     if (!s) return NULL;
     s->born = mono();
     deck_init(&s->dk);
+    atomic_store(&G.quit, 0);
     LOCK();
     if (!G.base[0]) make_dirs();
     G.refs++;
     int boot = !G.boot;
     if (boot) { G.boot = 1; map_default(); pc_default(); }
     UNLOCK();
-    if (boot) { account_load(); LOCK(); int has = G.cid[0]; if (has) G.acc_state = 1; UNLOCK(); if (has) spawn_job(job_verify, NULL); }
+    if (boot) { account_load(); LOCK(); int has = G.cid[0]; if (has) G.acc_state = 1; UNLOCK(); }
     if (boot) {
-        pthread_t t;
-        pthread_attr_t at;
-        pthread_attr_init(&at);
-        pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
-        pthread_attr_setstacksize(&at, 256 * 1024);
-        pthread_create(&t, &at, boot_thread, NULL);
-        pthread_attr_destroy(&at);
+        spawn_job(boot_thread, NULL);
     }
     return s;
 }
@@ -1216,6 +1352,8 @@ static void destroy(void *i) {
     UNLOCK();
     free(i);
     if (last) {
+        atomic_store(&G.quit, 1);   /* every network transfer stops at once; wait (at most 3 s) until no worker of ours is left */
+        for (int w = 0; w < 30 && atomic_load(&G.workers) > 0; w++) usleep(100000);
         pthread_mutex_lock(&G.padmu);
         for (int k = 0; k < NPADS; k++) { free(G.pad[k].d); G.pad[k].d = NULL; G.pad[k].frames = 0; }
         free(G.pv); G.pv = NULL; G.pv_frames = 0; G.pv_play = 0;
@@ -1291,7 +1429,7 @@ static int key_idx(const char *key, const char *prefix, int max) {
 }
 
 static const char KEYS[] = "qwertyuiopasdfghjklzxcvbnm";
-static const char *const QUICK[] = { "kick", "snare", "hihat", "clap", "bass", "808", "loop", "fx" };
+static const char *const QUICK[] = { "cartoon", "film", "jazz", "funk", "organ", "radio", "drums", "bells" };
 #define NQUICK 8
 
 static void q_add(char c) { LOCK(); size_t l = strlen(G.q); if (l < sizeof G.q - 2) { G.q[l] = c; G.q[l + 1] = 0; G.rev++; } UNLOCK(); }
@@ -1367,10 +1505,9 @@ static void set_param(void *inst, const char *key, const char *val) {
     }
     if (!strcmp(key, "register")) {
         LOCK(); int ok = strchr(G.email, '@') && strchr(strchr(G.email, '@'), '.') && strlen(G.email) > 5; int has = G.cid[0]; UNLOCK();
-        if (!ok) { note_set("Type your e-mail address first"); return; }
-        if (has) { note_set("An account is already saved: press TEST"); return; }
+        if (!ok && !has) { note_set("Type your e-mail address first"); return; }
         if (atomic_exchange(&G.busy, 1)) { note_set("Busy, wait a moment"); return; }
-        spawn_job(job_register, NULL);
+        spawn_job(has ? job_verify : job_register, NULL);
         return;
     }
     if (!strcmp(key, "acc_forget")) {
@@ -1528,7 +1665,8 @@ static int get_param(void *inst, const char *key, char *b, int n) {
         if (i < G.nres) {
             char ti[100];
             disp_text(ti, sizeof ti, G.res[i].title, 26);
-            snprintf(t, sizeof t, "%s%s   %ds  %s", i == G.rsel ? "> " : "   ", ti, G.res[i].dur, G.res[i].license);
+            if (G.res[i].dur > 0) snprintf(t, sizeof t, "%s%s   %ds  %s", i == G.rsel ? "> " : "   ", ti, G.res[i].dur, G.res[i].license);
+            else snprintf(t, sizeof t, "%s%s   %s", i == G.rsel ? "> " : "   ", ti, G.res[i].license);
         } else if (k == 1 && G.nres == 0) snprintf(t, sizeof t, "Type a word, then press SEARCH");
         UNLOCK();
         return put(b, n, t);
@@ -1619,7 +1757,7 @@ static int get_param(void *inst, const char *key, char *b, int n) {
     if (!strcmp(key, "email_txt")) { LOCK(); snprintf(t, sizeof t, "%s_", G.email); UNLOCK(); return put(b, n, t); }
     if (!strcmp(key, "acc_txt")) {
         LOCK();
-        if (G.cid[0]) snprintf(t, sizeof t, G.acc_state == 2 ? "ACCOUNT READY" : "WAITING FOR YOUR E-MAIL LINK...");
+        if (G.cid[0]) snprintf(t, sizeof t, G.acc_state == 2 ? "ACCOUNT READY" : "TAP THE MAIL LINK, THEN CHECK");
         else snprintf(t, sizeof t, "No account needed: search works without");
         UNLOCK();
         return put(b, n, t);
@@ -1765,6 +1903,9 @@ int mpc_engine_changed(void *inst, char *key, int len) {
     if (!s) return 0;
     int f = atomic_load(&s->dk.plat);
     if (f == s->plat_rep) return 0;
+    double nw = mono();
+    if (nw - s->plat_t < 0.11) return 0;   /* about 9 pictures a second is enough and keeps the MPC light */
+    s->plat_t = nw;
     s->plat_rep = f;
     snprintf(key, (size_t)len, "plat");
     return 1;

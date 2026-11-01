@@ -15,8 +15,8 @@ ROWS = 7
 AMBER, AMBER2, SILVER, GREY, DIM = "#ffb52e", "#c98410", "#e9e7e0", "#9a968c", "#6b675e"
 KEYS = "qwertyuiopasdfghjklzxcvbnm"
 EKEYS = "qwertyuiopasdfghjklzxcvbnm0123456789@._-"
-QUICK = ["kick", "snare", "hihat", "clap", "bass", "808", "loop", "fx"]
-VERSION_TXT = "1.4"
+QUICK = ["cartoon", "film", "jazz", "funk", "organ", "radio", "drums", "bells"]
+VERSION_TXT = "1.5"
 
 # ------------------------------------------------------------------ params (v1.0 order first, new ones appended at the end)
 P = []
@@ -207,7 +207,7 @@ def crate_art(x, y, w, h):
     return g
 
 # ------------------------------------------------------------------ the platter: a record with a happy dog on the label, 48 turned pictures for the live meter
-NPLAT, PS = 48, 250
+NPLAT, PS = 24, 250
 def platter_base(S=500):
     im = Image.new("RGBA", (S, S), (0, 0, 0, 0)); d = ImageDraw.Draw(im); c = S / 2
     def circ(r, fill=None, outline=None, w=1, cx=None, cy=None):
@@ -288,7 +288,7 @@ pair("padclear", 190, 52, "CLEAR PAD", 30)
 pair("learnpad", 190, 52, "LEARN PAD", 30)
 pair("learnbase", 390, 52, "LEARN ALL PADS", 32)
 pair("test", 300, 64, "TEST", 42, "silver")
-pair("register", 300, 56, "REGISTER", 38, "silver")
+pair("register", 300, 56, "REGISTER / CHECK", 30, "silver")
 pair("forget", 240, 56, "FORGET KEY", 30)
 pair("minus", 56, 48, "-", 40)
 pair("plus", 56, 48, "+", 40)
@@ -339,20 +339,20 @@ overlay("lbl_crate", [sk_rect(16, 108, 504, 508, 22, "none", INK, 4, 1.8), '<cir
 overlay("lbl_pads", [L("SELECTED PAD", 852, 202, 17, "#a8a49a", sp=3)] + [L(n, 852, y, 24, INK, sp=2) for n, y in
         (("ATTACK", 282), ("DECAY", 336), ("RELEASE", 390), ("GROUP", 444), ("MODE", 498))] +
         [L("SAME GROUP NUMBER = PADS CUT EACH OTHER OFF", 36, 600, 17, "#a8a49a", sp=2), dog(780, 620 - 86 + 40, .5, False)])
-overlay("lbl_account", [L("1  TYPE YOUR E-MAIL", 770, 208, 20, INK, sp=2), L("2  PRESS REGISTER", 770, 230, 20, INK, sp=2),
-                        L("3  TAP THE LINK IN THE MAIL FROM OPENVERSE", 770, 252, 20, INK, sp=2), L("OPTIONAL: SEARCH WORKS WITHOUT AN ACCOUNT", 770, 274, 20, GOLD, sp=2),
+overlay("lbl_account", [L("1  TYPE YOUR E-MAIL", 770, 208, 20, INK, sp=2), L("2  PRESS REGISTER, THEN TAP THE LINK", 770, 230, 20, INK, sp=2),
+                        L("3  PRESS CHECK (SAME BUTTON)", 770, 252, 20, INK, sp=2), L("OPTIONAL: SEARCH WORKS WITHOUT AN ACCOUNT", 770, 274, 20, GOLD, sp=2),
                         dog(1170, 520 - 86, 1.0), cat(1110, 610 - 86, 0.6, False)])
 info = [("CRATE DIGGA  V" + VERSION_TXT, 40, GOLD), ("BY JJ-LEMMING  -  JJ DA PLUG", 24, INK), ("", 0, 0),
         ("WHAT IT DOES", 26, GOLD),
-        ("SEARCH FREE SOUNDS ONLINE, HEAR THEM, KEEP THEM IN YOUR CRATE,", 20, "#cfcbc0"),
+        ("FIND FREE FILM MUSIC, CARTOONS, RADIO AND SOUNDS, HEAR THEM, KEEP THEM,", 20, "#cfcbc0"),
         ("PUT THEM ON THE 16 PADS OR SPIN THEM ON THE TURNTABLE.", 20, "#cfcbc0"), ("NO PHONE, NO COMPUTER NEEDED.", 20, "#cfcbc0"), ("", 0, 0),
         ("LICENSE", 26, GOLD),
-        ("ONLY CC0 AND PUBLIC DOMAIN SOUNDS ARE SHOWN (OPENVERSE.ORG + WIKIMEDIA COMMONS).", 20, "#cfcbc0"),
+        ("ONLY CC0 AND PUBLIC DOMAIN SOUNDS ARE SHOWN (ARCHIVE.ORG, WIKIMEDIA, OPENVERSE).", 20, "#cfcbc0"),
         ("EVERY KEPT SOUND GETS A TEXT FILE: TITLE, CREATOR, LICENSE, SOURCE.", 20, "#cfcbc0"), ("", 0, 0),
         ("PADS AND DECK", 26, GOLD),
         ("PAD 1-16 = MIDI NOTES 36-51 (AND 0-15). NOTHING TO LEARN. STOP SILENCES ALL.", 20, "#cfcbc0"),
         ("ATTACK, DECAY, RELEASE, MUTE GROUP PER PAD.  CRATE TAB = TURNTABLE.", 20, "#cfcbc0"), ("", 0, 0),
-        ("NO ACCOUNT NEEDED. IF OPENVERSE IS BUSY, WIKIMEDIA IS USED BY ITSELF.", 20, "#cfcbc0")]
+        ("NO ACCOUNT NEEDED. EMPTY SEARCH OR NO MATCH = FREE PICKS. ONLY THE START OF LONG FILES IS LOADED.", 20, "#cfcbc0")]
 parts = []; y = 214
 for s_, sz, col in info:
     if s_: parts.append(L(s_, 250, y, sz, col, sp=1.5))
@@ -475,7 +475,7 @@ ro_("dir_txt", 750, 684, 1000, 28, 20, "9a968c", "left")
 q()
 open(OUT + "/layout.conf", "w").write("\n".join(Lc) + "\n")
 
-json.dump({"name": "Crate Digga", "vendor": "JJ DA PLUG", "uid": "CrDg", "version": 130, "so": "crate.so", "params": "params.json",
+json.dump({"name": "Crate Digga", "vendor": "JJ DA PLUG", "uid": "CrDg", "version": 150, "so": "crate.so", "params": "params.json",
            "layout": "layout.conf", "art": "html", "defines": {"PARAM_TEXT_MAX": 128, "HAS_DISPLAY_REV": 1, "HAS_SONG_POS": 1},
            "build": {"root": ".", "sources": ["crate.c", "vorbis_glue.c"], "cflags": ["-I."], "libs": ["-lpthread", "-lm", "-ldl"]}},
           open(OUT + "/vst.json", "w"), indent=1)
