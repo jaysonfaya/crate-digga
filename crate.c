@@ -1,4 +1,4 @@
-/* CRATE DIGGA 1.5 (JJ DA PLUG): an MPC OS VST2 plugin (instrument) that digs for free sounds on the internet.
+/* CRATE DIGGA 1.6 (JJ DA PLUG): an MPC OS VST2 plugin (instrument) that digs for free sounds on the internet.
  * Made by JJ-LEMMING.
  *
  * It searches Openverse (https://openverse.org) for audio that is CC0 or Public Domain only: nothing else is ever requested
@@ -86,9 +86,10 @@ static struct {
     int pad_sel; signed char padmap[128]; int learn;
     char note[100]; double note_t;
     int curl_state; char netinfo[160]; unsigned rev;
-    struct { unsigned char att, dec, rel, grp, mode; } pc[NPADS];   /* per pad: attack, decay, release (steps), mute group 0-8, mode 0 one-shot / 1 hold */
+    struct { unsigned char att, dec, rel, grp, mode; float a, d, s, r, st, en; } pc[NPADS];   /* per pad: attack, decay, release (steps), mute group 0-8, mode 0 one-shot / 1 hold */
     int last_note, last_pad, acc_state;   /* acc_state: 0 no account, 1 waiting for the e-mail link, 2 ready */
     atomic_int verifying, quit, workers;
+    int wv_sel, wv_frames; const int16_t *wv_ptr; unsigned char wv[80]; int cfg_dirty; double cfg_dirty_t;   /* waveform columns of the pad shown in the editor */
     char email[64], cid[80], csec[80], tok[700]; double tok_exp;     /* the Openverse account */
 } G = { .mu = PTHREAD_MUTEX_INITIALIZER, .padmu = PTHREAD_MUTEX_INITIALIZER, .netmu = PTHREAD_MUTEX_INITIALIZER, .rsel = -1, .csel = -1, .apage = 1, .shortonly = 1, .last_note = -1, .last_pad = -1 };
 
@@ -96,8 +97,12 @@ static struct {
 #define NPLAT 24
 typedef struct { atomic_int pitch, prange, klock, jogv, jogref, jogstart, joglast, plat; atomic_llong jogt; } deck_t;
 static const int RANGE_PCT[3] = { 8, 16, 50 };
-static double deck_speed(deck_t *dk) { return 1.0 + (atomic_load(&dk->pitch) - 500) / 500.0 * RANGE_PCT[atomic_load(&dk->prange) % 3] / 100.0; }
-static void deck_init(deck_t *dk) { atomic_store(&dk->pitch, 500); atomic_store(&dk->prange, 1); atomic_store(&dk->jogv, 500); atomic_store(&dk->jogref, 500); atomic_store(&dk->joglast, 500); }
+static double deck_speed(deck_t *dk) {
+    int r = atomic_load(&dk->prange) % 4, p = atomic_load(&dk->pitch);
+    if (r == 3) return pow(2.0, (p - 500) / 500.0);   /* +-12 semitones: half speed to double speed */
+    return 1.0 + (p - 500) / 500.0 * RANGE_PCT[r] / 100.0;
+}
+static void deck_init(deck_t *dk) { atomic_store(&dk->pitch, 500); atomic_store(&dk->prange, 3); atomic_store(&dk->jogv, 500); atomic_store(&dk->jogref, 500); atomic_store(&dk->joglast, 500); }
 static long long now_ms(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (long long)t.tv_sec * 1000 + t.tv_nsec / 1000000; }
 
 #define LOCK() pthread_mutex_lock(&G.mu)
@@ -716,9 +721,12 @@ static int wiki_search(const char *qe, int apage, int shortonly, res_t *tmp, int
 static void val_str_any(const char *v, char *out, size_t cap) { if (v && *v == '[') v = skip_ws(v + 1); val_str(v, out, cap); }
 static const char *ia_root(void) { const char *e = getenv("CRATE_IA"); return e && *e ? e : "https://archive.org/"; }
 
-/* q: a few plain words, or "" for free picks. returns the number of sounds, or -1 */
-static int ia_search(const char *q, int apage, res_t *tmp, char *err, size_t ecap) {
-    char qq[300] = "mediatype:audio AND licenseurl:(*publicdomain*)", qe[900], url[1200];
+/* q: a few plain words (a genre, an instrument ...), or "" for free picks.
+ * cat 0 = music (spoken-word collections and subjects are left out), 1 = words (speech only), 2 = sounds. loose = a gentler filter when the strict one finds nothing. returns the number of sounds, or -1 */
+#define IA_SPOKEN_COLL "audio_bookspoetry OR librivoxaudio OR podcasts OR radioprograms OR audio_news OR audio_religion OR audio_foreign OR oldtimeradio"
+#define IA_SPOKEN_SUBJ "speech OR spoken OR interview OR audiobook OR sermon OR podcast OR lecture OR poetry OR talk OR news OR radio-show"
+static int ia_search(const char *q, int apage, int cat, int loose, res_t *tmp, char *err, size_t ecap) {
+    char qq[900] = "mediatype:audio AND licenseurl:(*publicdomain*)", qe[1800], url[2200];
     int words = 0;
     for (const char *p = q; *p && words < 4;) {
         while (*p == ' ') p++;
@@ -726,8 +734,12 @@ static int ia_search(const char *q, int apage, res_t *tmp, char *err, size_t eca
         while (*p && *p != ' ' && k < 30) { if (isalnum((unsigned char)*p)) w[k++] = *p; p++; }
         while (*p && *p != ' ') p++;
         w[k] = 0;
-        if (k) { size_t l = strlen(qq); snprintf(qq + l, sizeof qq - l, " AND (%s)", w); words++; }
+        if (k) { size_t l = strlen(qq); snprintf(qq + l, sizeof qq - l, " AND (title:(%s) OR subject:(%s))", w, w); words++; }   /* the word must be in the title or the genre tags */
     }
+    size_t l = strlen(qq);
+    if (cat == 1) { if (!loose) snprintf(qq + l, sizeof qq - l, " AND (collection:(" IA_SPOKEN_COLL ") OR subject:(" IA_SPOKEN_SUBJ "))"); }
+    else if (!loose) snprintf(qq + l, sizeof qq - l, " AND NOT collection:(" IA_SPOKEN_COLL ") AND NOT subject:(" IA_SPOKEN_SUBJ ")");
+    else snprintf(qq + l, sizeof qq - l, " AND NOT subject:(speech OR spoken OR interview OR podcast OR audiobook)");
     urlenc(qq, qe, sizeof qe);
     int page = apage;
     if (!words) { LOCK(); page = (G.pseed + apage) % 40 + 1; UNLOCK(); }
@@ -823,7 +835,7 @@ static int ia_resolve(const char *id, char *out, size_t cap, char *err, size_t e
 static int ov_search(const char *qe, int apage, int cat, res_t *tmp, char *err, size_t ecap) {
     char url[600], bearer[720];
     snprintf(url, sizeof url, "%saudio/?q=%s&license=cc0,pdm&page_size=%d&page=%d&mature=false%s", api_root(),
-             qe, NRES, apage, cat == 1 ? "&category=sound_effect" : cat == 2 ? "&category=music" : "");
+             qe, NRES, apage, cat == 2 ? "&category=sound_effect" : "&category=music");
     bearer_get(bearer, sizeof bearer);
     req_t rq = { NULL, bearer, NULL };
     buf_t b = {0};
@@ -894,15 +906,15 @@ static void *job_search(void *arg) {
     for (int k = 0; k < no && !offline; k++) {
         int sc = order[k];
         memset(tmp, 0, sizeof(res_t) * NRES); hidden = 0;
-        if (sc == 2) n = ia_search(picks ? "" : q, apage, tmp, err, sizeof err);
-        else if (sc == 1) n = wiki_search(picks ? "music" : qe, apage, shortonly, tmp, &hidden, err, sizeof err);
-        else n = picks ? 0 : ov_search(qe, apage, cat, tmp, err, sizeof err);
+        if (sc == 2) { n = ia_search(picks ? "" : q, apage, cat, 0, tmp, err, sizeof err); if (n == 0 && apage == 1 && !picks) { memset(tmp, 0, sizeof(res_t) * NRES); n = ia_search(q, apage, cat, 1, tmp, err, sizeof err); } }
+        else if (sc == 1) { char wq[200]; snprintf(wq, sizeof wq, "%s%s", picks ? "music" : qe, cat == 1 ? "%20spoken" : ""); n = wiki_search(wq, apage, shortonly, tmp, &hidden, err, sizeof err); }
+        else n = (picks || cat == 1) ? 0 : ov_search(qe, apage, cat, tmp, err, sizeof err);
         if (n < 0) { tried_err = 1; if (no_net(err)) offline = 1; }
         if (n > 0) { src = sc; break; }
     }
     if (n <= 0 && !offline && apage == 1 && !picks) {   /* nothing for this word: free picks instead */
         memset(tmp, 0, sizeof(res_t) * NRES); hidden = 0;
-        n = ia_search("", 1, tmp, err, sizeof err);
+        n = ia_search("", 1, cat == 1 ? 1 : 0, 0, tmp, err, sizeof err);
         if (n < 0 && no_net(err)) offline = 1;
         if (n > 0) { picks = 2; src = 2; }
     }
@@ -1205,7 +1217,12 @@ static const int REL_MS[] = { 5, 20, 50, 100, 200, 400, 800, 1500 };
 #define N_REL ((int)(sizeof REL_MS / sizeof *REL_MS))
 #define N_GRP 9
 
-static void pc_default(void) { for (int i = 0; i < NPADS; i++) { G.pc[i].att = 0; G.pc[i].dec = 0; G.pc[i].rel = 1; G.pc[i].grp = 0; G.pc[i].mode = 0; } }
+static void pc_default(void) { for (int i = 0; i < NPADS; i++) { G.pc[i].att = 0; G.pc[i].dec = 0; G.pc[i].rel = 1; G.pc[i].grp = 0; G.pc[i].mode = 0; G.pc[i].a = 0; G.pc[i].d = 0.3f; G.pc[i].s = 1; G.pc[i].r = 0.15f; G.pc[i].st = 0; G.pc[i].en = 1; } }
+#define A_MS(p) ((double)G.pc[p].a * G.pc[p].a * 1500.0)
+#define D_MS(p) ((double)G.pc[p].d * G.pc[p].d * 3000.0)
+#define R_MS(p) (5.0 + (double)G.pc[p].r * G.pc[p].r * 3000.0)
+#define NWV 80
+#define NEV 48
 
 static void cfg_save(void) {
     char dir[300], path[330], tmp[340];
@@ -1215,14 +1232,15 @@ static void cfg_save(void) {
     mkdir(dir, 0755);
     char names[NPADS][40];
     unsigned char pcs[NPADS][5];
+    float adsr[NPADS][6];
     pthread_mutex_lock(&G.padmu);
-    for (int i = 0; i < NPADS; i++) { snprintf(names[i], sizeof names[i], "%s", G.pad[i].d ? G.pad[i].name : ""); pcs[i][0] = G.pc[i].att; pcs[i][1] = G.pc[i].dec; pcs[i][2] = G.pc[i].rel; pcs[i][3] = G.pc[i].grp; pcs[i][4] = G.pc[i].mode; }
+    for (int i = 0; i < NPADS; i++) { snprintf(names[i], sizeof names[i], "%s", G.pad[i].d ? G.pad[i].name : ""); pcs[i][0] = G.pc[i].att; pcs[i][1] = G.pc[i].dec; pcs[i][2] = G.pc[i].rel; pcs[i][3] = G.pc[i].grp; pcs[i][4] = G.pc[i].mode; adsr[i][0] = G.pc[i].a; adsr[i][1] = G.pc[i].d; adsr[i][2] = G.pc[i].s; adsr[i][3] = G.pc[i].r; adsr[i][4] = G.pc[i].st; adsr[i][5] = G.pc[i].en; }
     pthread_mutex_unlock(&G.padmu);
     snprintf(path, sizeof path, "%s/pads.cfg", dir);
     snprintf(tmp, sizeof tmp, "%s/pads.tmp", dir);
     FILE *f = fopen(tmp, "w");
     if (!f) return;
-    for (int i = 0; i < NPADS; i++) { if (names[i][0]) fprintf(f, "name %d %s\n", i, names[i]); fprintf(f, "env %d %d %d %d %d %d\n", i, pcs[i][0], pcs[i][1], pcs[i][2], pcs[i][3], pcs[i][4]); }
+    for (int i = 0; i < NPADS; i++) { if (names[i][0]) fprintf(f, "name %d %s\n", i, names[i]); fprintf(f, "env %d %d %d %d %d %d\n", i, pcs[i][0], pcs[i][1], pcs[i][2], pcs[i][3], pcs[i][4]); fprintf(f, "adsr %d %.4f %.4f %.4f %.4f %.4f %.4f\n", i, adsr[i][0], adsr[i][1], adsr[i][2], adsr[i][3], adsr[i][4], adsr[i][5]); }
     for (int n = 0; n < 128; n++) if (map[n] >= 0) fprintf(f, "map %d %d\n", n, map[n]);
     if (fclose(f) == 0) rename(tmp, path); else unlink(tmp);
 }
@@ -1253,6 +1271,14 @@ static void *boot_thread(void *a) {
                 if (sscanf(line, "env %d %d %d %d %d %d", &pi, &a, &d, &rl, &g, &md) == 6 && pi >= 0 && pi < NPADS && a >= 0 && a < N_ATT && d >= 0 && d < N_DEC && rl >= 0 && rl < N_REL && g >= 0 && g < N_GRP) {
                     pthread_mutex_lock(&G.padmu);
                     G.pc[pi].att = (unsigned char)a; G.pc[pi].dec = (unsigned char)d; G.pc[pi].rel = (unsigned char)rl; G.pc[pi].grp = (unsigned char)g; G.pc[pi].mode = (unsigned char)(md ? 1 : 0);
+                    pthread_mutex_unlock(&G.padmu);
+                }
+            }
+            else if (!strncmp(line, "adsr ", 5)) {
+                int pi; float fa, fd, fs, fr, fst, fen;
+                if (sscanf(line, "adsr %d %f %f %f %f %f %f", &pi, &fa, &fd, &fs, &fr, &fst, &fen) == 7 && pi >= 0 && pi < NPADS && fa >= 0 && fa <= 1 && fd >= 0 && fd <= 1 && fs >= 0 && fs <= 1 && fr >= 0 && fr <= 1 && fst >= 0 && fen <= 1 && fen > fst + 0.01f) {
+                    pthread_mutex_lock(&G.padmu);
+                    G.pc[pi].a = fa; G.pc[pi].d = fd; G.pc[pi].s = fs; G.pc[pi].r = fr; G.pc[pi].st = fst; G.pc[pi].en = fen;
                     pthread_mutex_unlock(&G.padmu);
                 }
             }
@@ -1315,13 +1341,15 @@ typedef struct {
     atomic_int trig[NPADS];
     atomic_int rel[NPADS];            /* a note-off (hold mode) asks for the release */
     atomic_int stop;                  /* the transport stopped */
-    struct { int on; long pos; float gain; long age, rage; } voice[NPADS];   /* rage < 0: not releasing */
+    struct { int on; long pos; float gain; long age, rage; int fast; } voice[NPADS];   /* rage < 0: not releasing */
     deck_t dk;
     int plat_rep;
     double plat_t;
     unsigned seen_gen; double pv_posf; long pv_fade;
     double ang, anchor; int scr, hopc; struct { double src; int age; } gr[5]; int ngr;
     int was_playing;
+    double last_ppq;
+    int play_rep, pc_phase;   /* play_rep: -1 = no playhead */
     double born;
 } inst_t;
 
@@ -1330,6 +1358,7 @@ static void *create(const char *dir) {
     inst_t *s = calloc(1, sizeof *s);
     if (!s) return NULL;
     s->born = mono();
+    s->play_rep = -1;
     deck_init(&s->dk);
     atomic_store(&G.quit, 0);
     LOCK();
@@ -1368,6 +1397,8 @@ static void pad_trigger(inst_t *s, int p, int vel) {
 
 static void midi(void *i, const uint8_t *m, int n) {
     inst_t *s = i;
+    if (n >= 1 && m[0] == 0xFC) { atomic_store(&s->stop, 1); return; }   /* MIDI stop */
+    if (n >= 3 && (m[0] & 0xF0) == 0xB0 && (m[1] == 123 || m[1] == 120)) { atomic_store(&s->stop, 1); return; }   /* all notes off / all sound off */
     if (n >= 3 && (m[0] & 0xF0) == 0x80) {   /* note off */
         LOCK(); int p = G.padmap[m[1] & 127]; UNLOCK();
         if (p >= 0) atomic_store(&s->rel[p], 1);
@@ -1407,6 +1438,8 @@ static void song_pos(void *inst, double ppq, double bpm, int playing, int frames
     (void)ppq; (void)bpm; (void)frames;
     inst_t *s = inst;
     if (s->was_playing && !playing) atomic_store(&s->stop, 1);
+    if (!playing && ppq + 0.001 < s->last_ppq) atomic_store(&s->stop, 1);   /* STOP pressed again: the position jumps back to the start */
+    s->last_ppq = ppq;
     s->was_playing = playing ? 1 : 0;
 }
 
@@ -1429,7 +1462,7 @@ static int key_idx(const char *key, const char *prefix, int max) {
 }
 
 static const char KEYS[] = "qwertyuiopasdfghjklzxcvbnm";
-static const char *const QUICK[] = { "cartoon", "film", "jazz", "funk", "organ", "radio", "drums", "bells" };
+static const char *const QUICK[] = { "jazz", "funk", "soul", "film", "blues", "ambient", "cartoon", "drums" };
 #define NQUICK 8
 
 static void q_add(char c) { LOCK(); size_t l = strlen(G.q); if (l < sizeof G.q - 2) { G.q[l] = c; G.q[l + 1] = 0; G.rev++; } UNLOCK(); }
@@ -1452,6 +1485,62 @@ static void play_result(int idx) {   /* idx is an index into G.res; the tap also
     spawn_job(job_preview, j);
 }
 
+
+/* ---------- sample editor: waveform columns, envelope picture, sliders ---------- */
+
+/* the columns of the pad's waveform, recomputed when another pad or sound is shown (padmu held) */
+static void wave_refresh(int sel) {
+    const int16_t *d = G.pad[sel].d;
+    int fr = d ? G.pad[sel].frames : 0;
+    if (G.wv_sel == sel && G.wv_ptr == d && G.wv_frames == fr) return;
+    G.wv_sel = sel; G.wv_ptr = d; G.wv_frames = fr;
+    for (int i = 0; i < NWV; i++) {
+        int pk = 0;
+        if (fr > 0) {
+            long a = (long)((double)i * fr / NWV), z = (long)((double)(i + 1) * fr / NWV);
+            long stepw = (z - a) / 64 + 1;   /* look at most 64 samples per column */
+            for (long k = a; k < z && k < fr; k += stepw) { int v = abs(d[2 * k]); if (v > pk) pk = v; }
+        }
+        double lv = sqrt(pk / 32768.0) * 23.0 + 0.5;
+        G.wv[i] = (unsigned char)(lv > 23 ? 23 : lv);
+    }
+}
+/* 0..71 = state * 24 + level. state 0: outside the chosen part, 1: inside, 2: where a playing pad is right now */
+static int wave_col(const inst_t *s, int i, int sel) {
+    pthread_mutex_lock(&G.padmu);
+    wave_refresh(sel);
+    int lv = G.pad[sel].d ? G.wv[i] : 0, st = 0;
+    double t = (i + 0.5) / NWV;
+    if (G.pad[sel].d && t >= G.pc[sel].st && t <= G.pc[sel].en) st = 1;
+    if (G.pad[sel].d && s->voice[sel].on && G.pad[sel].frames > 0 && (int)((double)s->voice[sel].pos / G.pad[sel].frames * NWV) == i) st = 2;
+    pthread_mutex_unlock(&G.padmu);
+    return st * 24 + lv;
+}
+static int play_col(const inst_t *s, int sel) {
+    int c = -1;
+    pthread_mutex_lock(&G.padmu);
+    if (G.pad[sel].d && s->voice[sel].on && G.pad[sel].frames > 0) { c = (int)((double)s->voice[sel].pos / G.pad[sel].frames * NWV); if (c >= NWV) c = NWV - 1; if (c < 0) c = 0; }
+    pthread_mutex_unlock(&G.padmu);
+    return c;
+}
+/* column i of the envelope picture: 0..23 */
+static int env_col(int i, int sel) {
+    pthread_mutex_lock(&G.padmu);
+    double A = A_MS(sel), D = D_MS(sel), R = R_MS(sel), S = G.pc[sel].s;
+    pthread_mutex_unlock(&G.padmu);
+    if (S < 0.999 && D < 5) D = 5;
+    if (A < 1) A = 1;
+    double hold = 0.3 * (A + D + R) + 150.0, T = A + D + hold + R, t = (i + 0.5) / NEV * T, e;
+    if (t < A) e = t / A;
+    else if (t < A + D) e = 1.0 - (1.0 - S) * (t - A) / D;
+    else if (t < A + D + hold) e = S;
+    else e = S * (1.0 - (t - A - D - hold) / R);
+    if (e < 0) e = 0;
+    int lv = (int)(e * 23.0 + 0.5);
+    return lv > 23 ? 23 : lv;
+}
+static void edit_dirty(void) { LOCK(); G.cfg_dirty = 1; G.cfg_dirty_t = mono(); G.rev++; UNLOCK(); }
+
 static void set_param(void *inst, const char *key, const char *val) {
     inst_t *s = inst;
     deck_t *dk = &s->dk;
@@ -1464,17 +1553,38 @@ static void set_param(void *inst, const char *key, const char *val) {
         if (v > 485 && v < 515) v = 500;   /* detent in the middle: exactly 0 % */
         atomic_store(&dk->pitch, v); LOCK(); G.rev++; UNLOCK(); return;
     }
-    if (!strcmp(key, "prange")) { atomic_store(&dk->prange, atoi(val) % 3); LOCK(); G.rev++; UNLOCK(); return; }
+    if (!strcmp(key, "prange")) { atomic_store(&dk->prange, (atoi(val) % 4 + 4) % 4); LOCK(); G.rev++; UNLOCK(); return; }
     if (!strcmp(key, "klock")) { atomic_store(&dk->klock, atoi(val) ? 1 : 0); LOCK(); G.rev++; UNLOCK(); return; }
     if (!strcmp(key, "jog")) {
         int v = (int)(atof(val) * 1000.0 + 0.5); if (v < 0) v = 0; if (v > 1000) v = 1000;
         long long t = now_ms();
-        if (t - atomic_load(&dk->jogt) > 250) { atomic_store(&dk->jogref, atomic_load(&dk->joglast)); atomic_store(&dk->jogstart, 1); }
+        if (t - atomic_load(&dk->jogt) > 250) { atomic_store(&dk->jogref, v); atomic_store(&dk->jogstart, 1); }   /* a new touch starts where the finger is: no jump */
         atomic_store(&dk->jogv, v); atomic_store(&dk->joglast, v); atomic_store(&dk->jogt, t);
+        return;
+    }
+    if (!strncmp(key, "ed_", 3) && strcmp(key, "ed_play")) {   /* the sample editor's sliders: start, end, attack, decay, sustain, release of the selected pad */
+        double x = atof(val);
+        if (x < 0) x = 0; if (x > 1) x = 1;
+        LOCK(); int p = G.pad_sel; UNLOCK();
+        pthread_mutex_lock(&G.padmu);
+        if (!strcmp(key, "ed_start")) { G.pc[p].st = (float)x; if (G.pc[p].en < G.pc[p].st + 0.02f) G.pc[p].en = G.pc[p].st + 0.02f > 1 ? 1 : G.pc[p].st + 0.02f; if (G.pc[p].st > 0.98f) G.pc[p].st = 0.98f; }
+        else if (!strcmp(key, "ed_end")) { G.pc[p].en = (float)x; if (G.pc[p].en < G.pc[p].st + 0.02f) G.pc[p].st = G.pc[p].en - 0.02f < 0 ? 0 : G.pc[p].en - 0.02f; if (G.pc[p].en < 0.02f) G.pc[p].en = 0.02f; }
+        else if (!strcmp(key, "ed_a")) G.pc[p].a = (float)x;
+        else if (!strcmp(key, "ed_d")) G.pc[p].d = (float)x;
+        else if (!strcmp(key, "ed_s")) G.pc[p].s = (float)x;
+        else if (!strcmp(key, "ed_r")) G.pc[p].r = (float)x;
+        pthread_mutex_unlock(&G.padmu);
+        edit_dirty();
         return;
     }
     if (!fire) return;
     int k;
+    if (!strcmp(key, "ed_play")) { LOCK(); int p = G.pad_sel; UNLOCK(); pad_trigger(s, p, 110); return; }
+    if (!strcmp(key, "stop_all")) {   /* the sure way to end everything, whatever the transport does */
+        atomic_store(&s->stop, 1);
+        pthread_mutex_lock(&G.padmu); G.pv_play = 0; G.pv_gen++; pthread_mutex_unlock(&G.padmu);
+        return;
+    }
     if ((k = key_idx(key, "pd", NPADS))) {
         LOCK(); G.pad_sel = k - 1; G.rev++; UNLOCK();
         pad_trigger(s, k - 1, 110);
@@ -1753,7 +1863,7 @@ static int get_param(void *inst, const char *key, char *b, int n) {
     if (!strcmp(key, "prange")) return snprintf(b, (size_t)n, "%d", atomic_load(&dk->prange));
     if (!strcmp(key, "klock")) return snprintf(b, (size_t)n, "%d", atomic_load(&dk->klock));
     if (!strcmp(key, "plat")) return snprintf(b, (size_t)n, "%.4f", atomic_load(&dk->plat) / (double)(NPLAT - 1));
-    if (!strcmp(key, "pitch_txt")) { double sp = (deck_speed(dk) - 1.0) * 100.0; snprintf(t, sizeof t, "%+.1f %%", sp); return put(b, n, t); }
+    if (!strcmp(key, "pitch_txt")) { double sp = (deck_speed(dk) - 1.0) * 100.0; if (atomic_load(&dk->prange) == 3) snprintf(t, sizeof t, "%+.1f st", 12.0 * log2(deck_speed(dk))); else snprintf(t, sizeof t, "%+.1f %%", sp); return put(b, n, t); }
     if (!strcmp(key, "email_txt")) { LOCK(); snprintf(t, sizeof t, "%s_", G.email); UNLOCK(); return put(b, n, t); }
     if (!strcmp(key, "acc_txt")) {
         LOCK();
@@ -1782,15 +1892,49 @@ static int get_param(void *inst, const char *key, char *b, int n) {
         else snprintf(t, sizeof t, "%s", md ? "HOLD" : "ONE SHOT");
         return put(b, n, t);
     }
+    if (key[0] == 'w' && key[1] == 'v' && isdigit((unsigned char)key[2])) {
+        int i = atoi(key + 2);
+        if (i < 0 || i >= NWV) return 0;
+        LOCK(); int p = G.pad_sel; UNLOCK();
+        return snprintf(b, (size_t)n, "%.4f", wave_col((inst_t *)inst, i, p) / 71.0);
+    }
+    if (key[0] == 'e' && key[1] == 'v' && isdigit((unsigned char)key[2])) {
+        int i = atoi(key + 2);
+        if (i < 0 || i >= NEV) return 0;
+        LOCK(); int p = G.pad_sel; UNLOCK();
+        return snprintf(b, (size_t)n, "%.4f", env_col(i, p) / 23.0);
+    }
+    if (!strncmp(key, "ed_", 3)) {
+        LOCK(); int p = G.pad_sel; UNLOCK();
+        pthread_mutex_lock(&G.padmu);
+        double st = G.pc[p].st, en = G.pc[p].en, a = G.pc[p].a, d = G.pc[p].d, su = G.pc[p].s, r = G.pc[p].r, A = A_MS(p), D = D_MS(p), R = R_MS(p);
+        int fr = G.pad[p].d ? G.pad[p].frames : 0;
+        char nm[40]; snprintf(nm, sizeof nm, "%s", G.pad[p].d ? G.pad[p].name : "");
+        pthread_mutex_unlock(&G.padmu);
+        double tot = fr / 44100.0;
+        if (!strcmp(key, "ed_start")) return snprintf(b, (size_t)n, "%.4f", st);
+        if (!strcmp(key, "ed_end")) return snprintf(b, (size_t)n, "%.4f", en);
+        if (!strcmp(key, "ed_a")) return snprintf(b, (size_t)n, "%.4f", a);
+        if (!strcmp(key, "ed_d")) return snprintf(b, (size_t)n, "%.4f", d);
+        if (!strcmp(key, "ed_s")) return snprintf(b, (size_t)n, "%.4f", su);
+        if (!strcmp(key, "ed_r")) return snprintf(b, (size_t)n, "%.4f", r);
+        if (!strcmp(key, "ed_a_txt")) { snprintf(t, sizeof t, "ATTACK  %.0f ms", A); return put(b, n, t); }
+        if (!strcmp(key, "ed_d_txt")) { snprintf(t, sizeof t, "DECAY  %.0f ms", D); return put(b, n, t); }
+        if (!strcmp(key, "ed_s_txt")) { snprintf(t, sizeof t, "SUSTAIN  %.0f %%", su * 100.0); return put(b, n, t); }
+        if (!strcmp(key, "ed_r_txt")) { snprintf(t, sizeof t, "RELEASE  %.0f ms", R); return put(b, n, t); }
+        if (!strcmp(key, "ed_pos_txt")) { if (fr) snprintf(t, sizeof t, "%.2f s - %.2f s  (%.2f s)", st * tot, en * tot, (en - st) * tot); else snprintf(t, sizeof t, "empty pad"); return put(b, n, t); }
+        if (!strcmp(key, "ed_pad_txt")) { if (fr) snprintf(t, sizeof t, "PAD %d: %.28s  -  %.1f s", p + 1, nm, tot); else snprintf(t, sizeof t, "PAD %d is empty: RESULTS > KEEP > TO PAD", p + 1); return put(b, n, t); }
+    }
     if (!strcmp(key, "dir_txt")) { LOCK(); disp_text(t, sizeof t, G.base, 60); UNLOCK(); return put(b, n, t); }
     if (!strcmp(key, "display_rev")) {
+        { LOCK(); int sv = G.cfg_dirty && mono() - G.cfg_dirty_t > 1.5; if (sv) G.cfg_dirty = 0; UNLOCK(); if (sv) cfg_save_async(); }
         LOCK();
         unsigned fm = 0;
         for (int i = 0; i < 128; i++) fm = fm * 3u + (unsigned)(G.padmap[i] + 1);
         unsigned h = G.rev * 2654435761u + (unsigned)G.pad_sel * 31u + (unsigned)G.learn * 7u + fm + (unsigned)atomic_load(&G.busy) * 101u + (unsigned)G.cat * 13u + (unsigned)G.shortonly * 17u + (unsigned)G.pv_valid * 19u + (unsigned)G.pv_kept * 23u + (unsigned)atomic_load(&dk->pitch) * 31u + (unsigned)atomic_load(&dk->prange) * 7u + (unsigned)atomic_load(&dk->klock) * 5u + (unsigned)G.pv_play * 3u;
         UNLOCK();
         pthread_mutex_lock(&G.padmu);
-        for (int i = 0; i < NPADS; i++) h = h * 31u + (G.pad[i].d ? (unsigned)G.pad[i].frames : 0u) + G.pc[i].att * 3u + G.pc[i].dec * 5u + G.pc[i].rel * 7u + G.pc[i].grp * 11u + G.pc[i].mode * 13u;
+        for (int i = 0; i < NPADS; i++) h = h * 31u + (G.pad[i].d ? (unsigned)G.pad[i].frames : 0u) + G.pc[i].att * 3u + G.pc[i].dec * 5u + G.pc[i].rel * 7u + G.pc[i].grp * 11u + G.pc[i].mode * 13u + (unsigned)(G.pc[i].a * 1000) * 17u + (unsigned)(G.pc[i].d * 1000) * 19u + (unsigned)(G.pc[i].s * 1000) * 23u + (unsigned)(G.pc[i].r * 1000) * 29u + (unsigned)(G.pc[i].st * 1000) * 37u + (unsigned)(G.pc[i].en * 1000) * 41u;
         pthread_mutex_unlock(&G.padmu);
         double now = mono();
         LOCK(); h += (G.note[0] && now - G.note_t < 10.0) ? 1u : 0u; h += (G.status[0] && now - G.status_t < 120.0) ? 2u : 0u; UNLOCK();
@@ -1870,22 +2014,29 @@ static void render(void *inst, int16_t *out, int frames) {
         if (vel && G.pad[p].d) {
             int g = G.pc[p].grp;
             if (g) for (int q = 0; q < NPADS; q++) if (q != p && G.pc[q].grp == g && s->voice[q].on && s->voice[q].rage < 0) s->voice[q].rage = 0;   /* mute group: the others let go */
-            s->voice[p].on = 1; s->voice[p].pos = 0; s->voice[p].age = 0; s->voice[p].rage = -1; s->voice[p].gain = (float)vel / 127.0f;
+            s->voice[p].on = 1; s->voice[p].pos = (long)(G.pc[p].st * (float)G.pad[p].frames); s->voice[p].age = 0; s->voice[p].rage = -1; s->voice[p].fast = 0; s->voice[p].gain = (float)vel / 127.0f;
         }
         if (atomic_exchange(&s->rel[p], 0) && G.pc[p].mode == 1 && s->voice[p].on && s->voice[p].rage < 0) s->voice[p].rage = 0;
-        if (stopreq && s->voice[p].on && s->voice[p].rage < 0) s->voice[p].rage = 0;
+        if (stopreq && s->voice[p].on && !s->voice[p].fast) { s->voice[p].rage = 0; s->voice[p].fast = 1; }   /* STOP: every pad ends at once (10 ms ramp, no click) */
         if (!s->voice[p].on || !G.pad[p].d) continue;
         const int16_t *d = G.pad[p].d;
         long pos = s->voice[p].pos, total = G.pad[p].frames, age = s->voice[p].age, rage = s->voice[p].rage;
-        long att = (long)ATT_MS[G.pc[p].att] * 44100 / 1000, dec = (long)DEC_MS[G.pc[p].dec] * 44100 / 1000, rel = (long)REL_MS[G.pc[p].rel] * 44100 / 1000;
-        if (rel < 1) rel = 1;
+        long ef = (long)(G.pc[p].en * (float)total);
+        if (ef > total) ef = total;
+        long att = (long)(A_MS(p) * 44.1), dec = (long)(D_MS(p) * 44.1), rel = (long)(R_MS(p) * 44.1);
+        float sus = G.pc[p].s;
+        if (sus < 0.999f && dec < 220) dec = 220;
+        int hold = G.pc[p].mode == 1;
+        long rl = s->voice[p].fast ? 441 : rel;
+        if (rl < 1) rl = 1;
         float gain = s->voice[p].gain * 0.9f;
         for (int i = 0; i < frames; i++, pos++, age++) {
-            if (pos >= total) { s->voice[p].on = 0; break; }
+            if (pos >= ef) { s->voice[p].on = 0; break; }
             float e = 1.0f;
             if (att > 0 && age < att) e = (float)age / (float)att;
-            if (dec > 0) { long da = age - att; if (da < 0) da = 0; if (da >= dec) { s->voice[p].on = 0; break; } e *= 1.0f - (float)da / (float)dec; }
-            if (rage >= 0) { if (rage >= rel) { s->voice[p].on = 0; break; } e *= 1.0f - (float)rage / (float)rel; rage++; }
+            if (sus < 0.999f) { long da = age - att; if (da < 0) da = 0; float f = da >= dec ? 1.0f : (float)da / (float)dec; e *= 1.0f - (1.0f - sus) * f; }
+            if (rage < 0) { long remain = ef - pos, tail = hold ? 64 : rel; if (remain < tail) e *= (float)remain / (float)tail; }
+            else { if (rage >= rl) { s->voice[p].on = 0; break; } e *= 1.0f - (float)rage / (float)rl; rage++; }
             float g2 = gain * e;
             int a = out[2 * i] + (int)(d[2 * pos] * g2), c = out[2 * i + 1] + (int)(d[2 * pos + 1] * g2);
             out[2 * i] = (int16_t)(a > 32767 ? 32767 : a < -32768 ? -32768 : a);
@@ -1901,14 +2052,20 @@ int mpc_engine_changed(void *inst, char *key, int len);
 int mpc_engine_changed(void *inst, char *key, int len) {
     inst_t *s = inst;
     if (!s) return 0;
-    int f = atomic_load(&s->dk.plat);
-    if (f == s->plat_rep) return 0;
     double nw = mono();
-    if (nw - s->plat_t < 0.11) return 0;   /* about 9 pictures a second is enough and keeps the MPC light */
-    s->plat_t = nw;
-    s->plat_rep = f;
-    snprintf(key, (size_t)len, "plat");
-    return 1;
+    if (nw - s->plat_t < 0.11) return 0;   /* about 9 changes a second is enough and keeps the MPC light */
+    int f = atomic_load(&s->dk.plat);
+    if (f != s->plat_rep) { s->plat_t = nw; s->plat_rep = f; snprintf(key, (size_t)len, "plat"); return 1; }
+    /* the playhead of the sample editor: first the column it left, then the column it entered */
+    LOCK(); int sel = G.pad_sel; UNLOCK();
+    int c = play_col(s, sel);
+    if (c != s->play_rep || s->pc_phase) {
+        s->plat_t = nw;
+        if (s->pc_phase == 0 && s->play_rep >= 0) { s->pc_phase = 1; snprintf(key, (size_t)len, "wv%d", s->play_rep); return 1; }
+        s->pc_phase = 0; s->play_rep = c;
+        if (c >= 0) { snprintf(key, (size_t)len, "wv%d", c); return 1; }
+    }
+    return 0;
 }
 
 static const mpc_engine_t ENGINE = { create, destroy, midi, set_param, get_param, render, NULL, song_pos };

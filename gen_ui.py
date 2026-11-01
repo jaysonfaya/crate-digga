@@ -15,15 +15,15 @@ ROWS = 7
 AMBER, AMBER2, SILVER, GREY, DIM = "#ffb52e", "#c98410", "#e9e7e0", "#9a968c", "#6b675e"
 KEYS = "qwertyuiopasdfghjklzxcvbnm"
 EKEYS = "qwertyuiopasdfghjklzxcvbnm0123456789@._-"
-QUICK = ["cartoon", "film", "jazz", "funk", "organ", "radio", "drums", "bells"]
-VERSION_TXT = "1.5"
+QUICK = ["jazz", "funk", "soul", "film", "blues", "ambient", "cartoon", "drums"]
+VERSION_TXT = "1.6"
 
 # ------------------------------------------------------------------ params (v1.0 order first, new ones appended at the end)
 P = []
 def opt(key, name, options, default=0): P.append({"key": key, "name": name, "options": options, "default": default})
 def ro(key, name): P.append({"key": key, "name": name, "type": "readout", "display": "string"})
 def trig(key, name): P.append({"key": key, "name": name, "type": "trigger", "momentary": True})
-opt("cat", "Type", ["all", "sounds", "music"])
+opt("cat", "Type", ["music", "words", "sounds"])
 opt("shortonly", "Short only", ["off", "on"], 1)
 for k, n in [("q_txt", "Search word"), ("hdr_txt", "Status"), ("status_txt", "Search status"), ("note_txt", "Notice"), ("rs_info", "Result info"),
              ("r_page_txt", "Results page"), ("c_page_txt", "Crate page"), ("pv_txt", "Playing"), ("to_pad_txt", "To pad"), ("pad_info_txt", "Pad info"),
@@ -49,10 +49,18 @@ for t, n in [("e_back", "E-mail backspace"), ("e_clear", "E-mail clear"), ("regi
 P.append({"key": "pitch", "name": "Pitch", "min": 0, "max": 1, "default": 0.5})
 P.append({"key": "jog", "name": "Scratch", "min": 0, "max": 1, "default": 0.5})
 P.append({"key": "plat", "name": "Platter", "min": 0, "max": 1, "default": 0})
-opt("prange", "Pitch range", ["8%", "16%", "50%"], 1)
+opt("prange", "Pitch range", ["8%", "16%", "50%", "OCT"], 3)
 opt("klock", "Key lock", ["KEY OFF", "KEY ON"], 0)
 ro("pitch_txt", "Pitch value")
 trig("deck_cue", "Cue")
+# ---- new in 1.6: the sample editor (waveform, start/end, ADSR) and STOP ALL
+NWV, NEV = 80, 48
+for k, n, dflt in [("ed_start", "Start", 0), ("ed_end", "End", 1), ("ed_a", "Attack", 0), ("ed_d", "Decay", 0.3), ("ed_s", "Sustain", 1), ("ed_r", "Release", 0.15)]:
+    P.append({"key": k, "name": n, "min": 0, "max": 1, "default": dflt})
+for k, n in [("ed_a_txt", "Attack value"), ("ed_d_txt", "Decay value"), ("ed_s_txt", "Sustain value"), ("ed_r_txt", "Release value"), ("ed_pos_txt", "Start and end"), ("ed_pad_txt", "Edited pad")]: ro(k, n)
+trig("ed_play", "Play pad"); trig("stop_all", "Stop all")
+for i in range(NWV): P.append({"key": "wv%d" % i, "name": "Wave %d" % i, "min": 0, "max": 1, "default": 0})
+for i in range(NEV): P.append({"key": "ev%d" % i, "name": "Envelope %d" % i, "min": 0, "max": 1, "default": 0})
 json.dump({"name": "Crate Digga", "params": P}, open(OUT + "/params.json", "w"), indent=1)
 
 # ================================================================== look: black sticker, white hand-drawn lines, gold, own dog and cat
@@ -318,6 +326,35 @@ bg += paw(1262, 300, .8) + paw(1250, 470, .6) + note(1262, 560, .8) + note(14, 3
 bg += '<rect x="696" y="16" width="560" height="64" rx="9" fill="none" stroke="%s" stroke-width="3" stroke-linecap="round" stroke-dasharray="0.1 8" opacity=".75"/>' % INK
 svg("bg", 1280, 628, bg)
 
+# ---- sample editor pictures: one column of the waveform (72 pictures: outside / inside / playing x 24 heights) and one of the envelope (24 heights)
+WW, WH, EW, EH = 11, 100, 13, 100
+_w = Image.new("RGBA", (WW, WH * 72), (0, 0, 0, 0)); _wd = ImageDraw.Draw(_w)
+for _st, _col in enumerate(((88, 85, 78, 255), (244, 241, 234, 255), (255, 181, 46, 255))):
+    for _lv in range(24):
+        _y0 = (_st * 24 + _lv) * WH; _h = int(_lv / 23.0 * 46) + 1
+        if _st == 2: _wd.rectangle([WW // 2 - 1, _y0 + 2, WW // 2, _y0 + WH - 3], fill=(255, 181, 46, 150))
+        _wd.rectangle([1, _y0 + WH // 2 - _h, WW - 2, _y0 + WH // 2 + _h - 1], fill=_col)
+_w.save(IMG + "/wave.png")
+_e = Image.new("RGBA", (EW, EH * 24), (0, 0, 0, 0)); _ed = ImageDraw.Draw(_e)
+for _lv in range(24):
+    _h = int(_lv / 23.0 * 94) + 2
+    _ed.rectangle([0, _lv * EH + EH - 2 - _h, EW - 1, _lv * EH + EH - 2], fill=(255, 181, 46, 255 if _lv else 120))
+_e.save(IMG + "/env.png")
+Image.new("RGBA", (12, 250), (0, 0, 0, 0)).save(IMG + "/clr_thumb.png")
+Image.new("RGBA", (300, 250), (0, 0, 0, 0)).save(IMG + "/clr_track.png")
+_t = Image.new("RGBA", (22, 38), (0, 0, 0, 0)); _td = ImageDraw.Draw(_t)
+_td.polygon([(2, 2), (20, 2), (20, 26), (11, 36), (2, 26)], fill=(255, 181, 46, 255), outline=(244, 241, 234, 255))
+_t.save(IMG + "/ed_thumb.png")
+_k = Image.new("RGBA", (912, 38), (0, 0, 0, 0)); ImageDraw.Draw(_k).rounded_rectangle([0, 15, 911, 22], radius=3, fill=(88, 85, 78, 255), outline=(244, 241, 234, 255))
+_k.save(IMG + "/ed_track.png")
+_t2 = Image.new("RGBA", (16, 24), (0, 0, 0, 0)); ImageDraw.Draw(_t2).rounded_rectangle([1, 1, 14, 22], radius=5, fill=(255, 181, 46, 255), outline=(244, 241, 234, 255))
+_t2.save(IMG + "/ed_thumb2.png")
+_k2 = Image.new("RGBA", (270, 24), (0, 0, 0, 0)); ImageDraw.Draw(_k2).rounded_rectangle([0, 9, 269, 14], radius=3, fill=(88, 85, 78, 255), outline=(244, 241, 234, 255))
+_k2.save(IMG + "/ed_track2.png")
+for _n in range(1, 17): pair("sp%d" % _n, 70, 44, str(_n), 30)
+pair("stopall", 300, 56, "STOP ALL", 38, "silver")
+pair("edplay", 300, 56, "PLAY PAD", 38, "silver")
+
 # ------------------------------------------------------------------ per-tab lettering (svg y = layout y - 86)
 def dots(cx, cy, w, h):
     """a dotted white outline that shows where a live text line sits"""
@@ -325,8 +362,8 @@ def dots(cx, cy, w, h):
     return '<rect x="%.1f" y="%.1f" width="%d" height="%d" rx="9" fill="none" stroke="%s" stroke-width="3" stroke-linecap="round" stroke-dasharray="0.1 8" opacity=".75"/>' % (x, y, w, h, INK)
 DOTS = {"lbl_search": [(330, 672, 600, 28), (880, 612, 440, 32), (1185, 612, 150, 32)],
         "lbl_crate": [(500, 540, 100, 26), (790, 584, 500, 32), (1145, 584, 190, 32), (890, 622, 700, 28)],
-        "lbl_pads": [(1050, 226, 420, 32), (330, 626, 600, 30), (330, 662, 600, 28), (1050, 662, 420, 28)] + [(1135, y, 130, 40) for y in (282, 336, 390, 444)],
-        "lbl_account": [(640, 652, 500, 30), (640, 698, 1200, 22)], "lbl_info": [(1000, 640, 440, 36), (750, 684, 1000, 28)]}
+        "lbl_pads": [(1050, 226, 420, 32), (330, 626, 600, 30), (330, 662, 600, 28), (1050, 662, 420, 28), (1135, 282, 130, 40)],
+        "lbl_edit": [(490, 268, 900, 28), (1110, 330, 300, 28), (840, 498, 270, 28), (1130, 498, 270, 28), (840, 582, 270, 28), (1130, 582, 270, 28), (330, 690, 600, 26)], "lbl_info": [(1000, 640, 440, 36), (750, 684, 1000, 28)]}
 def overlay(name, parts): svg(name, 1280, 628, "".join(parts) + "".join(dots(*d) for d in DOTS.get(name, [])))
 def L(s, x, y, size=18, fill="#a8a49a", anchor="start", sp=2, fn="BebasNeue"): return txc(s, x, y - 86, size, fill, anchor, fn, sp)
 overlay("lbl_search", [L("SHORT ONLY", 1160, 266, 14, INK, "middle", 2)])
@@ -335,23 +372,22 @@ _arm = (sk_ell(455, 150, 22, 22, "#2a2927", INK, 3, .8) + sk_ell(455, 150, 8, 8,
         sk_rect(280, 282, 38, 20, 6, GOLD, INK, 3, .8, False).replace('/>', ' transform="rotate(-45 299 292)"/>', 1) +
         sk_rect(446, 100, 18, 40, 5, INK, INK, 2, .6, False))
 overlay("lbl_crate", [sk_rect(16, 108, 504, 508, 22, "none", INK, 4, 1.8), '<circle cx="175" cy="259" r="138" fill="#050505" stroke="%s" stroke-width="3"/>' % INK, _arm,
-    L("PITCH", 492, 318, 18, INK, "middle", 2), L("SCRATCH", 200, 496, 18, INK, "middle", 3), L("RANGE", 335, 664, 17, "#a8a49a", sp=2), paw(430, 560 - 86 + 8, .6)])
-overlay("lbl_pads", [L("SELECTED PAD", 852, 202, 17, "#a8a49a", sp=3)] + [L(n, 852, y, 24, INK, sp=2) for n, y in
-        (("ATTACK", 282), ("DECAY", 336), ("RELEASE", 390), ("GROUP", 444), ("MODE", 498))] +
-        [L("SAME GROUP NUMBER = PADS CUT EACH OTHER OFF", 36, 600, 17, "#a8a49a", sp=2), dog(780, 620 - 86 + 40, .5, False)])
-overlay("lbl_account", [L("1  TYPE YOUR E-MAIL", 770, 208, 20, INK, sp=2), L("2  PRESS REGISTER, THEN TAP THE LINK", 770, 230, 20, INK, sp=2),
-                        L("3  PRESS CHECK (SAME BUTTON)", 770, 252, 20, INK, sp=2), L("OPTIONAL: SEARCH WORKS WITHOUT AN ACCOUNT", 770, 274, 20, GOLD, sp=2),
-                        dog(1170, 520 - 86, 1.0), cat(1110, 610 - 86, 0.6, False)])
+    L("PITCH", 492, 318, 18, INK, "middle", 2), L("TOUCH THE RECORD TO SCRATCH", 175, 498, 17, INK, "middle", 2), L("RANGE", 352, 670, 15, "#a8a49a", sp=2), paw(430, 560 - 86 + 8, .6)])
+overlay("lbl_pads", [L("SELECTED PAD", 852, 202, 17, "#a8a49a", sp=3)] + [L(n, 852, y, 24, INK, sp=2) for n, y in (("GROUP", 282), ("MODE", 336))] +
+        [L("SAME GROUP NUMBER = PADS CUT EACH OTHER OFF", 36, 600, 17, "#a8a49a", sp=2), L("START, END, ATTACK, DECAY, SUSTAIN, RELEASE: TAB EDIT", 852, 470, 17, GOLD, sp=1), dog(780, 620 - 86 + 40, .5, False)])
+overlay("lbl_edit", [sk_rect(36, 322 - 86, 900, 104, 10, "#0a0a0b", "#3a3834", 2.5), sk_rect(36, 490 - 86, 636, 104, 10, "#0a0a0b", "#3a3834", 2.5),
+                     L("START", 44, 297, 15, GOLD, sp=2), L("END", 44, 461, 15, GOLD, sp=2), L("ENVELOPE", 40, 483, 16, "#a8a49a", sp=3),
+                     L("MODE", 40, 622, 16, "#a8a49a", sp=3), L("MUTE GROUP", 330, 622, 16, "#a8a49a", sp=3)])
 info = [("CRATE DIGGA  V" + VERSION_TXT, 40, GOLD), ("BY JJ-LEMMING  -  JJ DA PLUG", 24, INK), ("", 0, 0),
         ("WHAT IT DOES", 26, GOLD),
-        ("FIND FREE FILM MUSIC, CARTOONS, RADIO AND SOUNDS, HEAR THEM, KEEP THEM,", 20, "#cfcbc0"),
-        ("PUT THEM ON THE 16 PADS OR SPIN THEM ON THE TURNTABLE.", 20, "#cfcbc0"), ("NO PHONE, NO COMPUTER NEEDED.", 20, "#cfcbc0"), ("", 0, 0),
+        ("FIND FREE MUSIC BY GENRE, WORDS OR SOUNDS: MUSIC AND SPOKEN WORD ARE KEPT APART.", 20, "#cfcbc0"),
+        ("HEAR THEM, KEEP THEM, PUT THEM ON THE 16 PADS OR SPIN THEM ON THE TURNTABLE.", 20, "#cfcbc0"), ("NO PHONE, NO COMPUTER, NO ACCOUNT NEEDED.", 20, "#cfcbc0"), ("", 0, 0),
         ("LICENSE", 26, GOLD),
         ("ONLY CC0 AND PUBLIC DOMAIN SOUNDS ARE SHOWN (ARCHIVE.ORG, WIKIMEDIA, OPENVERSE).", 20, "#cfcbc0"),
         ("EVERY KEPT SOUND GETS A TEXT FILE: TITLE, CREATOR, LICENSE, SOURCE.", 20, "#cfcbc0"), ("", 0, 0),
         ("PADS AND DECK", 26, GOLD),
-        ("PAD 1-16 = MIDI NOTES 36-51 (AND 0-15). NOTHING TO LEARN. STOP SILENCES ALL.", 20, "#cfcbc0"),
-        ("ATTACK, DECAY, RELEASE, MUTE GROUP PER PAD.  CRATE TAB = TURNTABLE.", 20, "#cfcbc0"), ("", 0, 0),
+        ("PAD 1-16 = MIDI NOTES 36-51 (AND 0-15). STOP ENDS EVERYTHING AT ONCE.", 20, "#cfcbc0"),
+        ("EDIT TAB: WAVEFORM, START AND END, ATTACK DECAY SUSTAIN RELEASE. CRATE TAB: TOUCH THE RECORD.", 20, "#cfcbc0"), ("", 0, 0),
         ("NO ACCOUNT NEEDED. EMPTY SEARCH OR NO MATCH = FREE PICKS. ONLY THE START OF LONG FILES IS LOADED.", 20, "#cfcbc0")]
 parts = []; y = 214
 for s_, sz, col in info:
@@ -417,11 +453,11 @@ q = tab("CRATE", "lbl_crate")
 add("meter cx=175 cy=345 w=250 h=250 key=plat strip=images/platter.png frames=%d" % NPLAT)
 add("slider_v cx=492 cy=420 w=50 h=170 label=\"\" key=pitch look=fader ns=0 vs=0 bw=50")
 ro_("pitch_txt", 500, 540, 100, 26, 18, "ffb52e", "center", "bold")
-add("slider_h cx=200 cy=520 w=340 h=40 label=\"\" key=jog look=fader ns=0 vs=0 bw=340")
+add("slider_h cx=175 cy=345 w=300 h=250 label=\"\" key=jog img=images/clr_thumb.png base=images/clr_track.png ns=0 vs=0 bw=300")   # invisible: the finger on the record is the scratch
 btn("pv_play", 100, 604, 160, 56, "startstop")
 btn("deck_cue", 235, 604, 100, 56, "cue")
 add("enum_h cx=390 cy=604 label=\"\" key=klock sw=95 sh=50 img=images/seg_off.svg img_on=images/seg_on.svg")
-add("enum_h cx=170 cy=664 label=\"\" key=prange sw=100 sh=44 img=images/seg_off.svg img_on=images/seg_on.svg")
+add("enum_h cx=180 cy=664 label=\"\" key=prange sw=80 sh=44 img=images/seg_off.svg img_on=images/seg_on.svg")
 for i in range(ROWS): rowbtn("ct%d" % (i + 1), "c%d" % (i + 1), 890, 222 + i * 52, 700, 48, "row_p")
 ro_("pv_txt", 790, 584, 500, 32, 22, "e9e7e0", "left", "semibold")
 ro_("c_page_txt", 1145, 584, 190, 32, 22, "9a968c", "right")
@@ -438,11 +474,11 @@ for r in range(4):
         n = (3 - r) * 4 + c + 1
         add("button cx=%d cy=%d label=\"\" key=pd%d get=pn%d tsize=22 tweight=semibold tcolor=e9e7e0 talign=center img=images/pad.svg img_on=images/pad_on.svg w=186 h=84" % (125 + c * 196, 246 + r * 96, n, n))
 ro_("pad_info_txt", 1050, 226, 420, 32, 22, "e9e7e0", "left", "semibold")
-for key, y in (("att", 282), ("dec", 336), ("rel", 390), ("grp", 444)):
-    btn(key + "_m", 1040, y, 56, 48, "minus")
-    ro_(key + "_txt", 1135, y, 130, 40, 26, "ffb52e", "center", "bold")
-    btn(key + "_p", 1230, y, 56, 48, "plus")
-add("button cx=1135 cy=498 label=\"\" key=mode_t get=mode_txt tsize=26 tweight=bold tcolor=ffb52e talign=center img=images/row_m.svg img_on=images/row_m_on.svg w=240 h=48")
+btn("grp_m", 1040, 282, 56, 48, "minus")
+ro_("grp_txt", 1135, 282, 130, 40, 26, "ffb52e", "center", "bold")
+btn("grp_p", 1230, 282, 56, 48, "plus")
+add("button cx=1135 cy=336 label=\"\" key=mode_t get=mode_txt tsize=26 tweight=bold tcolor=ffb52e talign=center img=images/row_m.svg img_on=images/row_m_on.svg w=240 h=48")
+btn("stop_all", 1050, 410, 300, 56, "stopall")
 btn("pad_clear", 950, 556, 190, 52, "padclear")
 btn("learn_pad", 1150, 556, 190, 52, "learnpad")
 btn("learn_base", 1050, 614, 390, 52, "learnbase")
@@ -450,21 +486,25 @@ ro_("learn_txt", 1050, 662, 420, 28, 20, "ffb52e", "center", "semibold")
 ro_("last_txt", 330, 626, 600, 30, 22, "e9e7e0", "left", "semibold")
 ro_("note_txt", 330, 662, 600, 28, 22, "ffb52e", "left", "semibold")
 q()
-# ---- ACCOUNT: a free Openverse key so searching is not limited
-q = tab("ACCOUNT", "lbl_account")
-add("art file=images/frame_e.svg x=30 y=196 w=700 h=60")
-ro_("email_txt", 380, 226, 660, 50, 34, "ffb52e", "left", "bold")
-ek = [list(range(26, 36)), list(range(0, 10)), list(range(10, 19)), list(range(19, 26))]
-for r, idx in enumerate(ek):
-    x0 = 80 + (0 if r < 2 else 52 if r == 2 else 104)
-    for c, i in enumerate(idx): btn("ec%d" % i, x0 + c * 104, 336 + r * 62, 96, 56)
-for c, i in enumerate((36, 37, 38, 39)): btn("ec%d" % i, 130 + c * 104, 336 + 4 * 62, 96, 56)
-btn("e_back", 580, 336 + 4 * 62, 170, 56, "kback")
-btn("e_clear", 770, 336 + 4 * 62, 170, 56, "kclear")
-btn("register", 220, 652, 300, 56, "register")
-btn("acc_forget", 1100, 652, 240, 56, "forget")
-ro_("acc_txt", 640, 652, 500, 30, 22, "e9e7e0", "center", "semibold")
-ro_("note_txt", 640, 698, 1200, 22, 20, "ffb52e", "left", "semibold")
+# ---- EDIT: the sample editor of the selected pad: waveform with start/end, envelope picture with attack/decay/sustain/release
+q = tab("EDIT", "lbl_edit")
+for i in range(16): btn("pd%d" % (i + 1), 66 + i * 74, 226, 70, 44, "sp%d" % (i + 1))
+ro_("ed_pad_txt", 490, 268, 900, 28, 22, "e9e7e0", "left", "semibold")
+add("slider_h cx=486 cy=306 w=912 h=38 label=\"\" key=ed_start img=images/ed_thumb.png base=images/ed_track.png ns=0 vs=0 bw=912")
+for i in range(NWV): add("meter cx=%d cy=374 w=%d h=%d key=wv%d strip=images/wave.png frames=72" % (46 + i * WW, WW, WH, i))
+add("slider_h cx=486 cy=442 w=912 h=38 label=\"\" key=ed_end img=images/ed_thumb.png base=images/ed_track.png ns=0 vs=0 bw=912")
+ro_("ed_pos_txt", 1110, 330, 300, 28, 20, "ffb52e", "left", "semibold")
+btn("ed_play", 1110, 386, 280, 56, "edplay")
+btn("stop_all", 1110, 450, 280, 56, "stopall")
+for i in range(NEV): add("meter cx=%d cy=540 w=%d h=%d key=ev%d strip=images/env.png frames=24" % (47 + i * EW, EW, EH, i))
+for n, (key, c, r) in enumerate((("ed_a", 0, 0), ("ed_d", 1, 0), ("ed_s", 0, 1), ("ed_r", 1, 1))):
+    ro_(key + "_txt", 840 + c * 290, 498 + r * 84, 270, 28, 22, "ffb52e", "left", "bold")
+    add("slider_h cx=%d cy=%d w=270 h=24 label=\"\" key=%s img=images/ed_thumb2.png base=images/ed_track2.png ns=0 vs=0 bw=270" % (840 + c * 290, 530 + r * 84, key))
+add("button cx=165 cy=652 label=\"\" key=mode_t get=mode_txt tsize=26 tweight=bold tcolor=ffb52e talign=center img=images/row_m.svg img_on=images/row_m_on.svg w=240 h=48")
+btn("grp_m", 400, 652, 56, 48, "minus")
+ro_("grp_txt", 500, 652, 130, 40, 26, "ffb52e", "center", "bold")
+btn("grp_p", 600, 652, 56, 48, "plus")
+ro_("note_txt", 330, 690, 600, 26, 20, "ffb52e", "left", "semibold")
 q()
 # ---- INFO (last)
 q = tab("INFO", "lbl_info")
@@ -475,7 +515,7 @@ ro_("dir_txt", 750, 684, 1000, 28, 20, "9a968c", "left")
 q()
 open(OUT + "/layout.conf", "w").write("\n".join(Lc) + "\n")
 
-json.dump({"name": "Crate Digga", "vendor": "JJ DA PLUG", "uid": "CrDg", "version": 150, "so": "crate.so", "params": "params.json",
+json.dump({"name": "Crate Digga", "vendor": "JJ DA PLUG", "uid": "CrDg", "version": 160, "so": "crate.so", "params": "params.json",
            "layout": "layout.conf", "art": "html", "defines": {"PARAM_TEXT_MAX": 128, "HAS_DISPLAY_REV": 1, "HAS_SONG_POS": 1},
            "build": {"root": ".", "sources": ["crate.c", "vorbis_glue.c"], "cflags": ["-I."], "libs": ["-lpthread", "-lm", "-ldl"]}},
           open(OUT + "/vst.json", "w"), indent=1)
