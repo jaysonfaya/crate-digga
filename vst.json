@@ -2,7 +2,7 @@
  "name": "Crate Digga",
  "vendor": "JJ DA PLUG",
  "uid": "CrDg",
- "version": 110,
+ "version": 130,
  "so": "crate.so",
  "params": "params.json",
  "layout": "layout.conf",

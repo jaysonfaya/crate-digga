@@ -1,4 +1,4 @@
-/* CRATE DIGGA 0.1 (JJ DA PLUG): an MPC OS VST2 plugin (instrument) that digs for free sounds on the internet.
+/* CRATE DIGGA 1.3 (JJ DA PLUG): an MPC OS VST2 plugin (instrument) that digs for free sounds on the internet.
  * Made by JJ-LEMMING.
  *
  * It searches Openverse (https://openverse.org) for audio that is CC0 or Public Domain only: nothing else is ever requested
@@ -87,9 +87,18 @@ static struct {
     char note[100]; double note_t;
     int curl_state; char netinfo[160]; unsigned rev;
     struct { unsigned char att, dec, rel, grp, mode; } pc[NPADS];   /* per pad: attack, decay, release (steps), mute group 0-8, mode 0 one-shot / 1 hold */
-    int last_note, last_pad;
+    int last_note, last_pad, acc_state;   /* acc_state: 0 no account, 1 waiting for the e-mail link, 2 ready */
+    atomic_int verifying;
     char email[64], cid[80], csec[80], tok[700]; double tok_exp;     /* the Openverse account */
 } G = { .mu = PTHREAD_MUTEX_INITIALIZER, .padmu = PTHREAD_MUTEX_INITIALIZER, .netmu = PTHREAD_MUTEX_INITIALIZER, .rsel = -1, .csel = -1, .apage = 1, .shortonly = 1, .last_note = -1, .last_pad = -1 };
+
+/* the turntable: pitch fader, range, key lock, scratch slider, platter picture (frame number of the filmstrip) */
+#define NPLAT 48
+typedef struct { atomic_int pitch, prange, klock, jogv, jogref, jogstart, joglast, plat; atomic_llong jogt; } deck_t;
+static const int RANGE_PCT[3] = { 8, 16, 50 };
+static double deck_speed(deck_t *dk) { return 1.0 + (atomic_load(&dk->pitch) - 500) / 500.0 * RANGE_PCT[atomic_load(&dk->prange) % 3] / 100.0; }
+static void deck_init(deck_t *dk) { atomic_store(&dk->pitch, 500); atomic_store(&dk->prange, 1); atomic_store(&dk->jogv, 500); atomic_store(&dk->jogref, 500); atomic_store(&dk->joglast, 500); }
+static long long now_ms(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (long long)t.tv_sec * 1000 + t.tv_nsec / 1000000; }
 
 #define LOCK() pthread_mutex_lock(&G.mu)
 #define UNLOCK() pthread_mutex_unlock(&G.mu)
@@ -180,7 +189,7 @@ static int http_curl(const req_t *rq, const char *url, buf_t *b, long timeout, c
     CURL.setopt(h, 52, 1L);                           /* FOLLOWLOCATION */
     CURL.setopt(h, 68, 5L);                           /* MAXREDIRS */
     CURL.setopt(h, 13, timeout);                      /* TIMEOUT */
-    CURL.setopt(h, 78, 12L);                          /* CONNECTTIMEOUT */
+    CURL.setopt(h, 78, 7L);                          /* CONNECTTIMEOUT */
     CURL.setopt(h, 10018, "CrateDigga/0.1 (JJ DA PLUG; MPC)");   /* USERAGENT */
     CURL.setopt(h, 99, 1L);                           /* NOSIGNAL */
     CURL.setopt(h, 10102, "");                        /* ACCEPT_ENCODING: whatever curl supports */
@@ -857,6 +866,34 @@ static void *job_test(void *arg) {
     return NULL;
 }
 
+/* after REGISTER (and at every start with an account that is not confirmed yet): ask Openverse every 6 seconds whether the e-mail link was tapped,
+ * so there is nothing to press: the status turns to "Account ready" by itself */
+static void *job_verify(void *arg) {
+    (void)arg;
+    if (atomic_exchange(&G.verifying, 1)) return NULL;
+    for (int tries = 0; tries < 100; tries++) {
+        char bearer[720], url[300], err[100];
+        buf_t b; long code = 0;
+        LOCK(); G.tok[0] = 0; UNLOCK();
+        bearer_get(bearer, sizeof bearer);
+        int ok = 0;
+        if (bearer[0]) {
+            snprintf(url, sizeof url, "%srate_limit/", api_root());
+            req_t rq = { NULL, bearer };
+            if (http_req(&rq, url, &b, 1 << 16, 10, err, sizeof err, &code) == 0) {
+                const char *vf = b.d ? obj_get((const char *)b.d, "verified") : NULL;
+                ok = vf && !strncmp(vf, "true", 4);
+                free(b.d);
+            }
+        }
+        LOCK(); G.acc_state = ok ? 2 : 1; G.rev++; UNLOCK();
+        if (ok) { status_set("Account ready: searching is open now"); break; }
+        for (int k = 0; k < 6; k++) { sleep(1); LOCK(); int gone = !G.cid[0]; UNLOCK(); if (gone) { atomic_store(&G.verifying, 0); return NULL; } }
+    }
+    atomic_store(&G.verifying, 0);
+    return NULL;
+}
+
 /* the one-time free account: name, purpose and the typed e-mail address go to Openverse; the id and secret that come back are kept in openverse.txt */
 static void *job_register(void *arg) {
     (void)arg;
@@ -886,7 +923,8 @@ static void *job_register(void *arg) {
             if (ok) { char line[200]; int n = snprintf(line, sizeof line, "%s\n%s\n", id, sec); ok = write(fd, line, (size_t)n) == n; close(fd); }
             if (ok) {
                 LOCK(); snprintf(G.cid, sizeof G.cid, "%s", id); snprintf(G.csec, sizeof G.csec, "%s", sec); G.tok[0] = 0; UNLOCK();
-                snprintf(m, sizeof m, "Done. Open the e-mail from Openverse and tap its link, then press TEST");
+                snprintf(m, sizeof m, "Done. Now tap the link in the e-mail from Openverse. This screen notices it by itself");
+                LOCK(); G.acc_state = 1; UNLOCK();
             } else snprintf(m, sizeof m, "Registered, but the key could not be saved");
         } else snprintf(m, sizeof m, "Unexpected answer from Openverse");
     } else if (code == 429) snprintf(m, sizeof m, "Openverse says too many requests: try again in a while");
@@ -895,6 +933,8 @@ static void *job_register(void *arg) {
     free(b.d);
     status_set(m);
     atomic_store(&G.busy, 0);
+    LOCK(); int started = G.acc_state == 1; UNLOCK();
+    if (started) job_verify(NULL);
     return NULL;
 }
 
@@ -967,7 +1007,7 @@ static void *boot_thread(void *a) {
         while (fgets(line, sizeof line, f)) {
             int i, nn;
             char nm[60];
-            if (sscanf(line, "name %d %59[^\n]", &i, nm) == 2 && i >= 0 && i < NPADS) snprintf(names[i], sizeof names[i], "%s", nm);
+            if (sscanf(line, "name %d %39[^\n]", &i, nm) == 2 && i >= 0 && i < NPADS) snprintf(names[i], sizeof names[i], "%s", nm);
             else if (!strncmp(line, "env ", 4)) {
                 int pi, a, d, rl, g, md;
                 if (sscanf(line, "env %d %d %d %d %d %d", &pi, &a, &d, &rl, &g, &md) == 6 && pi >= 0 && pi < NPADS && a >= 0 && a < N_ATT && d >= 0 && d < N_DEC && rl >= 0 && rl < N_REL && g >= 0 && g < N_GRP) {
@@ -1036,7 +1076,10 @@ typedef struct {
     atomic_int rel[NPADS];            /* a note-off (hold mode) asks for the release */
     atomic_int stop;                  /* the transport stopped */
     struct { int on; long pos; float gain; long age, rage; } voice[NPADS];   /* rage < 0: not releasing */
-    unsigned seen_gen; long pv_pos; long pv_fade;
+    deck_t dk;
+    int plat_rep;
+    unsigned seen_gen; double pv_posf; long pv_fade;
+    double ang, anchor; int scr, hopc; struct { double src; int age; } gr[5]; int ngr;
     int was_playing;
     double born;
 } inst_t;
@@ -1046,13 +1089,14 @@ static void *create(const char *dir) {
     inst_t *s = calloc(1, sizeof *s);
     if (!s) return NULL;
     s->born = mono();
+    deck_init(&s->dk);
     LOCK();
     if (!G.base[0]) make_dirs();
     G.refs++;
     int boot = !G.boot;
     if (boot) { G.boot = 1; map_default(); pc_default(); }
     UNLOCK();
-    if (boot) account_load();
+    if (boot) { account_load(); LOCK(); int has = G.cid[0]; if (has) G.acc_state = 1; UNLOCK(); if (has) spawn_job(job_verify, NULL); }
     if (boot) {
         pthread_t t;
         pthread_attr_t at;
@@ -1172,10 +1216,25 @@ static void play_result(int idx) {   /* idx is an index into G.res; the tap also
 
 static void set_param(void *inst, const char *key, const char *val) {
     inst_t *s = inst;
+    deck_t *dk = &s->dk;
     int v = atoi(val);
     int fire = atof(val) > 0.5;
     if (!strcmp(key, "cat")) { LOCK(); G.cat = v < 0 ? 0 : v > 2 ? 2 : v; G.rev++; UNLOCK(); return; }
     if (!strcmp(key, "shortonly")) { LOCK(); G.shortonly = v ? 1 : 0; G.rev++; UNLOCK(); return; }
+    if (!strcmp(key, "pitch")) {
+        int v = (int)(atof(val) * 1000.0 + 0.5); if (v < 0) v = 0; if (v > 1000) v = 1000;
+        if (v > 485 && v < 515) v = 500;   /* detent in the middle: exactly 0 % */
+        atomic_store(&dk->pitch, v); LOCK(); G.rev++; UNLOCK(); return;
+    }
+    if (!strcmp(key, "prange")) { atomic_store(&dk->prange, atoi(val) % 3); LOCK(); G.rev++; UNLOCK(); return; }
+    if (!strcmp(key, "klock")) { atomic_store(&dk->klock, atoi(val) ? 1 : 0); LOCK(); G.rev++; UNLOCK(); return; }
+    if (!strcmp(key, "jog")) {
+        int v = (int)(atof(val) * 1000.0 + 0.5); if (v < 0) v = 0; if (v > 1000) v = 1000;
+        long long t = now_ms();
+        if (t - atomic_load(&dk->jogt) > 250) { atomic_store(&dk->jogref, atomic_load(&dk->joglast)); atomic_store(&dk->jogstart, 1); }
+        atomic_store(&dk->jogv, v); atomic_store(&dk->joglast, v); atomic_store(&dk->jogt, t);
+        return;
+    }
     if (!fire) return;
     int k;
     if ((k = key_idx(key, "pd", NPADS))) {
@@ -1203,6 +1262,9 @@ static void set_param(void *inst, const char *key, const char *val) {
     }
     if (!strcmp(key, "e_back")) { LOCK(); size_t l = strlen(G.email); if (l) G.email[l - 1] = 0; G.rev++; UNLOCK(); return; }
     if (!strcmp(key, "e_clear")) { LOCK(); G.email[0] = 0; G.rev++; UNLOCK(); return; }
+    if (!strcmp(key, "deck_cue")) {
+        pthread_mutex_lock(&G.padmu); G.pv_play = 0; G.pv_gen++; pthread_mutex_unlock(&G.padmu); return;
+    }
     if (!strcmp(key, "register")) {
         LOCK(); int ok = strchr(G.email, '@') && strchr(strchr(G.email, '@'), '.') && strlen(G.email) > 5; int has = G.cid[0]; UNLOCK();
         if (!ok) { note_set("Type your e-mail address first"); return; }
@@ -1213,7 +1275,7 @@ static void set_param(void *inst, const char *key, const char *val) {
     }
     if (!strcmp(key, "acc_forget")) {
         char p[300];
-        LOCK(); snprintf(p, sizeof p, "%s/openverse.txt", G.base); G.cid[0] = 0; G.csec[0] = 0; G.tok[0] = 0; G.rev++; UNLOCK();
+        LOCK(); snprintf(p, sizeof p, "%s/openverse.txt", G.base); G.cid[0] = 0; G.csec[0] = 0; G.tok[0] = 0; G.acc_state = 0; G.rev++; UNLOCK();
         unlink(p);
         note_set("Account key removed from this MPC");
         return;
@@ -1325,7 +1387,7 @@ static int put(char *b, int n, const char *s) { int r = snprintf(b, (size_t)n, "
 static int is_trigger(const char *key) {
     static const char *const fixed[] = { "k_space", "k_back", "k_clear", "do_search", "r_prev", "r_next", "pv_play", "keep", "to_pad", "c_prev", "c_next", "c_del",
                                          "pad_clear", "learn_pad", "learn_base", "net_test", "e_back", "e_clear", "register", "acc_forget",
-                                         "att_m", "att_p", "dec_m", "dec_p", "rel_m", "rel_p", "grp_m", "grp_p", "mode_t" };
+                                         "deck_cue", "att_m", "att_p", "dec_m", "dec_p", "rel_m", "rel_p", "grp_m", "grp_p", "mode_t" };
     for (size_t i = 0; i < sizeof fixed / sizeof *fixed; i++) if (!strcmp(key, fixed[i])) return 1;
     return (key[0] == 'k' && key[1] == 'c' && isdigit((unsigned char)key[2])) || key_idx(key, "pq", NQUICK) || key_idx(key, "rt", ROWS) ||
            key_idx(key, "ct", ROWS) || key_idx(key, "pd", NPADS) ||
@@ -1333,7 +1395,7 @@ static int is_trigger(const char *key) {
 }
 
 static int get_param(void *inst, const char *key, char *b, int n) {
-    (void)inst;
+    deck_t *dk = &((inst_t *)inst)->dk;
     char t[300] = "";
     int k;
     if (n <= 1) return 0;
@@ -1448,10 +1510,16 @@ static int get_param(void *inst, const char *key, char *b, int n) {
         UNLOCK();
         return put(b, n, t);
     }
+    if (!strcmp(key, "pitch")) return snprintf(b, (size_t)n, "%.4f", atomic_load(&dk->pitch) / 1000.0);
+    if (!strcmp(key, "jog")) return snprintf(b, (size_t)n, "%.4f", atomic_load(&dk->jogv) / 1000.0);
+    if (!strcmp(key, "prange")) return snprintf(b, (size_t)n, "%d", atomic_load(&dk->prange));
+    if (!strcmp(key, "klock")) return snprintf(b, (size_t)n, "%d", atomic_load(&dk->klock));
+    if (!strcmp(key, "plat")) return snprintf(b, (size_t)n, "%.4f", atomic_load(&dk->plat) / (double)(NPLAT - 1));
+    if (!strcmp(key, "pitch_txt")) { double sp = (deck_speed(dk) - 1.0) * 100.0; snprintf(t, sizeof t, "%+.1f %%", sp); return put(b, n, t); }
     if (!strcmp(key, "email_txt")) { LOCK(); snprintf(t, sizeof t, "%s_", G.email); UNLOCK(); return put(b, n, t); }
     if (!strcmp(key, "acc_txt")) {
         LOCK();
-        if (G.cid[0]) snprintf(t, sizeof t, "Account saved on this MPC");
+        if (G.cid[0]) snprintf(t, sizeof t, G.acc_state == 2 ? "ACCOUNT READY" : "WAITING FOR YOUR E-MAIL LINK...");
         else snprintf(t, sizeof t, "No account yet: searches are limited");
         UNLOCK();
         return put(b, n, t);
@@ -1481,7 +1549,7 @@ static int get_param(void *inst, const char *key, char *b, int n) {
         LOCK();
         unsigned fm = 0;
         for (int i = 0; i < 128; i++) fm = fm * 3u + (unsigned)(G.padmap[i] + 1);
-        unsigned h = G.rev * 2654435761u + (unsigned)G.pad_sel * 31u + (unsigned)G.learn * 7u + fm + (unsigned)atomic_load(&G.busy) * 101u + (unsigned)G.cat * 13u + (unsigned)G.shortonly * 17u + (unsigned)G.pv_valid * 19u + (unsigned)G.pv_kept * 23u;
+        unsigned h = G.rev * 2654435761u + (unsigned)G.pad_sel * 31u + (unsigned)G.learn * 7u + fm + (unsigned)atomic_load(&G.busy) * 101u + (unsigned)G.cat * 13u + (unsigned)G.shortonly * 17u + (unsigned)G.pv_valid * 19u + (unsigned)G.pv_kept * 23u + (unsigned)atomic_load(&dk->pitch) * 31u + (unsigned)atomic_load(&dk->prange) * 7u + (unsigned)atomic_load(&dk->klock) * 5u + (unsigned)G.pv_play * 3u;
         UNLOCK();
         pthread_mutex_lock(&G.padmu);
         for (int i = 0; i < NPADS; i++) h = h * 31u + (G.pad[i].d ? (unsigned)G.pad[i].frames : 0u) + G.pc[i].att * 3u + G.pc[i].dec * 5u + G.pc[i].rel * 7u + G.pc[i].grp * 11u + G.pc[i].mode * 13u;
@@ -1497,20 +1565,67 @@ static int get_param(void *inst, const char *key, char *b, int n) {
  * Each pad voice has an envelope: attack ramp, optional decay to silence, and a release after a note-off (hold mode), a mute-group choke or STOP. */
 static void render(void *inst, int16_t *out, int frames) {
     inst_t *s = inst;
+    deck_t *dk = &s->dk;
     memset(out, 0, (size_t)frames * 4);
     if (pthread_mutex_trylock(&G.padmu) != 0) return;
     int stopreq = atomic_exchange(&s->stop, 0);
     if (stopreq) s->pv_fade = s->pv_fade ? s->pv_fade : 882;
-    if (s->seen_gen != G.pv_gen) { s->seen_gen = G.pv_gen; s->pv_pos = 0; s->pv_fade = 0; }
-    if (G.pv && G.pv_play && s->pv_pos < G.pv_frames) {
-        long pos = s->pv_pos;
-        for (int i = 0; i < frames && pos < G.pv_frames; i++, pos++) {
-            float g = 0.8f;
-            if (s->pv_fade) { g *= (float)s->pv_fade / 882.0f; if (--s->pv_fade == 0) { pos = G.pv_frames; } }
-            out[2 * i] = (int16_t)(G.pv[2 * pos] * g);
-            out[2 * i + 1] = (int16_t)(G.pv[2 * pos + 1] * g);
-        }
-        s->pv_pos = pos;
+    if (s->seen_gen != G.pv_gen) { s->seen_gen = G.pv_gen; s->pv_posf = 0; s->pv_fade = 0; s->ngr = 0; s->hopc = 0; }
+    {
+        /* the turntable: play / scratch the loaded sound; the platter picture follows the movement */
+        const int16_t *d = G.pv; double total = G.pv_frames, pos = s->pv_posf, speed = deck_speed(dk), p0 = pos;
+        int klock = atomic_load(&dk->klock), scr = (now_ms() - atomic_load(&dk->jogt)) < 250;
+        atomic_store(&dk->jogstart, 0);
+        if (scr && !s->scr) { s->anchor = pos; }
+        s->scr = scr;
+        int playing = d && G.pv_play && pos < total - 2;
+        if (d && (playing || scr)) {
+            double target = s->anchor + (atomic_load(&dk->jogv) - atomic_load(&dk->jogref)) / 1000.0 * 88200.0;
+            if (target < 0) target = 0; if (target > total - 2) target = total - 2;
+            double rate = scr ? (target - pos) / (3.0 * frames) : speed;
+            if (rate > 8) rate = 8; if (rate < -8) rate = -8;
+            if (klock && !scr) {   /* time stretch: grains read at normal pitch, the grain start moves with the tempo */
+                enum { GL = 1024, HS = 256 };
+                static float win[GL]; static int win_ok;
+                if (!win_ok) { for (int k = 0; k < GL; k++) win[k] = 0.5f - 0.5f * cosf(6.2831853f * (float)k / GL); win_ok = 1; }
+                for (int i = 0; i < frames; i++) {
+                    if (s->hopc <= 0) { if (s->ngr < 5) { s->gr[s->ngr].src = pos; s->gr[s->ngr].age = 0; s->ngr++; } pos += HS * speed; s->hopc += HS; }
+                    s->hopc--;
+                    float l = 0, rr = 0;
+                    for (int k = 0; k < s->ngr; k++) {
+                        long ix = (long)s->gr[k].src + s->gr[k].age;
+                        if (ix >= 0 && ix < (long)total) {
+                            float w = win[s->gr[k].age];
+                            l += w * d[2 * ix]; rr += w * d[2 * ix + 1];
+                        }
+                        s->gr[k].age++;
+                    }
+                    for (int k = 0; k < s->ngr; ) { if (s->gr[k].age >= GL) { s->gr[k] = s->gr[s->ngr - 1]; s->ngr--; } else k++; }
+                    float g = 0.4f;
+                    if (s->pv_fade) { g *= (float)s->pv_fade / 882.0f; if (--s->pv_fade == 0) { pos = total; } }
+                    int a = (int)(l * g), c = (int)(rr * g);
+                    out[2 * i] = (int16_t)(a > 32767 ? 32767 : a < -32768 ? -32768 : a);
+                    out[2 * i + 1] = (int16_t)(c > 32767 ? 32767 : c < -32768 ? -32768 : c);
+                    if (pos >= total - 2) break;
+                }
+            } else {
+                s->ngr = 0; s->hopc = 0;
+                for (int i = 0; i < frames; i++) {
+                    if (pos < 0 || pos >= total - 1) { if (!scr) pos = total; break; }
+                    long ix = (long)pos; float fr = (float)(pos - ix), g = 0.8f;
+                    if (s->pv_fade) { g *= (float)s->pv_fade / 882.0f; if (--s->pv_fade == 0) { pos = total; break; } }
+                    out[2 * i] = (int16_t)((d[2 * ix] * (1 - fr) + d[2 * ix + 2] * fr) * g);
+                    out[2 * i + 1] = (int16_t)((d[2 * ix + 1] * (1 - fr) + d[2 * ix + 3] * fr) * g);
+                    pos += rate;
+                }
+            }
+            s->pv_posf = pos;
+            /* the platter: 33 1/3 turns a minute at normal speed, follows the scratching, forwards and backwards */
+            double moved = klock && !scr ? frames * speed : pos - p0;
+            s->ang += moved / 44100.0 * (100.0 / 3.0 / 60.0);
+        } else if (G.pv_play && d == NULL) { /* nothing loaded */ }
+        double fa = s->ang - floor(s->ang);
+        atomic_store(&dk->plat, (int)(fa * NPLAT) % NPLAT);
     }
     for (int p = 0; p < NPADS; p++) {
         int vel = atomic_exchange(&s->trig[p], 0);
@@ -1541,6 +1656,18 @@ static void render(void *inst, int16_t *out, int frames) {
         s->voice[p].pos = pos; s->voice[p].age = age; s->voice[p].rage = rage;
     }
     pthread_mutex_unlock(&G.padmu);
+}
+
+/* the wrapper asks once per audio block which of our values moved by themselves and tells the host (about 40 times a second), so the platter picture turns smoothly */
+int mpc_engine_changed(void *inst, char *key, int len);
+int mpc_engine_changed(void *inst, char *key, int len) {
+    inst_t *s = inst;
+    if (!s) return 0;
+    int f = atomic_load(&s->dk.plat);
+    if (f == s->plat_rep) return 0;
+    s->plat_rep = f;
+    snprintf(key, (size_t)len, "plat");
+    return 1;
 }
 
 static const mpc_engine_t ENGINE = { create, destroy, midi, set_param, get_param, render, NULL, song_pos };

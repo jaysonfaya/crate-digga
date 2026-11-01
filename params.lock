@@ -184,3 +184,10 @@ rel_p
 grp_m
 grp_p
 mode_t
+pitch
+jog
+plat
+prange
+klock
+pitch_txt
+deck_cue
