@@ -86,7 +86,10 @@ static struct {
     int pad_sel; signed char padmap[128]; int learn;
     char note[100]; double note_t;
     int curl_state; char netinfo[160]; unsigned rev;
-} G = { .mu = PTHREAD_MUTEX_INITIALIZER, .padmu = PTHREAD_MUTEX_INITIALIZER, .netmu = PTHREAD_MUTEX_INITIALIZER, .rsel = -1, .csel = -1, .apage = 1, .shortonly = 1 };
+    struct { unsigned char att, dec, rel, grp, mode; } pc[NPADS];   /* per pad: attack, decay, release (steps), mute group 0-8, mode 0 one-shot / 1 hold */
+    int last_note, last_pad;
+    char email[64], cid[80], csec[80], tok[700]; double tok_exp;     /* the Openverse account */
+} G = { .mu = PTHREAD_MUTEX_INITIALIZER, .padmu = PTHREAD_MUTEX_INITIALIZER, .netmu = PTHREAD_MUTEX_INITIALIZER, .rsel = -1, .csel = -1, .apage = 1, .shortonly = 1, .last_note = -1, .last_pad = -1 };
 
 #define LOCK() pthread_mutex_lock(&G.mu)
 #define UNLOCK() pthread_mutex_unlock(&G.mu)
@@ -113,6 +116,8 @@ typedef struct { uint8_t *d; size_t n, cap, max; int over; } buf_t;
 
 static struct {
     void *h;
+    void *(*slist_add)(void *, const char *);
+    void (*slist_free)(void *);
     void *(*init)(void);
     int (*setopt)(void *, int, ...);
     int (*perform)(void *);
@@ -129,13 +134,15 @@ static int curl_load(void) {
             static const char *const names[] = { "libcurl.so.4", "libcurl-gnutls.so.4", "libcurl.so", NULL };
             for (int i = 0; names[i] && !CURL.h; i++) CURL.h = dlopen(names[i], RTLD_NOW);
             if (CURL.h) {
+                *(void **)&CURL.slist_add = dlsym(CURL.h, "curl_slist_append");
+                *(void **)&CURL.slist_free = dlsym(CURL.h, "curl_slist_free_all");
                 *(void **)&CURL.init = dlsym(CURL.h, "curl_easy_init");
                 *(void **)&CURL.setopt = dlsym(CURL.h, "curl_easy_setopt");
                 *(void **)&CURL.perform = dlsym(CURL.h, "curl_easy_perform");
                 *(void **)&CURL.cleanup = dlsym(CURL.h, "curl_easy_cleanup");
                 *(void **)&CURL.getinfo = dlsym(CURL.h, "curl_easy_getinfo");
                 *(void **)&CURL.strerr = dlsym(CURL.h, "curl_easy_strerror");
-                if (CURL.init && CURL.setopt && CURL.perform && CURL.cleanup && CURL.getinfo && CURL.strerr) G.curl_state = 1;
+                if (CURL.slist_add && CURL.slist_free && CURL.init && CURL.setopt && CURL.perform && CURL.cleanup && CURL.getinfo && CURL.strerr) G.curl_state = 1;
             }
         }
     }
@@ -161,7 +168,9 @@ static size_t wcb(void *p, size_t sz, size_t nm, void *u) {
     return n;
 }
 
-static int http_curl(const char *url, buf_t *b, long timeout, char *err, size_t ecap, long *code) {
+typedef struct { const char *post, *bearer; } req_t;
+
+static int http_curl(const req_t *rq, const char *url, buf_t *b, long timeout, char *err, size_t ecap, long *code) {
     void *h = CURL.init();
     if (!h) { snprintf(err, ecap, "curl init failed"); return -1; }
     const char *ca = getenv("CRATE_CAINFO");
@@ -176,16 +185,25 @@ static int http_curl(const char *url, buf_t *b, long timeout, char *err, size_t 
     CURL.setopt(h, 99, 1L);                           /* NOSIGNAL */
     CURL.setopt(h, 10102, "");                        /* ACCEPT_ENCODING: whatever curl supports */
     if (ca && *ca) CURL.setopt(h, 10065, ca);         /* CAINFO (tests only) */
+    void *hdr = NULL;
+    if (rq && rq->bearer && *rq->bearer) {
+        char ah[760];
+        snprintf(ah, sizeof ah, "Authorization: Bearer %s", rq->bearer);
+        hdr = CURL.slist_add(hdr, ah);
+        CURL.setopt(h, 10023, hdr);                   /* HTTPHEADER */
+    }
+    if (rq && rq->post) CURL.setopt(h, 10015, rq->post);   /* POSTFIELDS (form encoded) */
     int rc = CURL.perform(h);
     long c = 0;
     CURL.getinfo(h, 0x200002, &c);                    /* RESPONSE_CODE */
     CURL.cleanup(h);
+    if (hdr) CURL.slist_free(hdr);
     *code = c;
     if (rc != 0) { snprintf(err, ecap, "%s", b->over ? "File too big" : CURL.strerr(rc)); return -1; }
     return 0;
 }
 
-static int http_spawn(const char *url, buf_t *b, long timeout, char *err, size_t ecap, long *code) {
+static int http_spawn(const req_t *rq, const char *url, buf_t *b, long timeout, char *err, size_t ecap, long *code) {
     char tmp[80], tm[16], mx[24];
     snprintf(tmp, sizeof tmp, "/tmp/crate_%d_%ld.dl", (int)getpid(), (long)time(NULL));
     snprintf(tm, sizeof tm, "%ld", timeout);
@@ -197,15 +215,32 @@ static int http_spawn(const char *url, buf_t *b, long timeout, char *err, size_t
     for (int i = 0; curls[i] && !bin; i++) if (!access(curls[i], X_OK)) { bin = curls[i]; is_curl = 1; }
     for (int i = 0; wgets[i] && !bin; i++) if (!access(wgets[i], X_OK)) bin = wgets[i];
     if (!bin) { snprintf(err, ecap, "No curl library or program on this MPC"); return -1; }
-    char *argv_c[] = { (char *)"curl", (char *)"-sSLf", (char *)"--max-time", tm, (char *)"--max-filesize", mx, (char *)"-A", (char *)"CrateDigga/0.1", (char *)"-o", tmp, (char *)url, NULL };
+    char ah[760] = "";
+    if (rq && rq->bearer && *rq->bearer) snprintf(ah, sizeof ah, "Authorization: Bearer %s", rq->bearer);
+    char *argv_c[16];
+    int ac = 0;
+    argv_c[ac++] = (char *)"curl"; argv_c[ac++] = (char *)"-sSL"; argv_c[ac++] = (char *)"--max-time"; argv_c[ac++] = tm;
+    argv_c[ac++] = (char *)"--max-filesize"; argv_c[ac++] = mx; argv_c[ac++] = (char *)"-A"; argv_c[ac++] = (char *)"CrateDigga/0.1";
+    if (ah[0]) { argv_c[ac++] = (char *)"-H"; argv_c[ac++] = ah; }
+    if (rq && rq->post) { argv_c[ac++] = (char *)"-d"; argv_c[ac++] = (char *)rq->post; }
+    argv_c[ac++] = (char *)"-w"; argv_c[ac++] = (char *)"%{http_code}"; argv_c[ac++] = (char *)"-o"; argv_c[ac++] = tmp; argv_c[ac++] = (char *)url; argv_c[ac] = NULL;
     char *argv_w[] = { (char *)"wget", (char *)"-q", (char *)"-T", tm, (char *)"-O", tmp, (char *)url, NULL };
     char *envp[] = { (char *)"PATH=/usr/bin:/bin:/usr/local/bin", NULL };   /* a clean environment: no LD_PRELOAD from the MPC */
     pid_t pid;
-    if (posix_spawn(&pid, bin, NULL, NULL, is_curl ? argv_c : argv_w, envp)) { snprintf(err, ecap, "Cannot start %s", bin); return -1; }
+    char outf[90];
+    snprintf(outf, sizeof outf, "%s.code", tmp);
+    posix_spawn_file_actions_t fa;
+    posix_spawn_file_actions_init(&fa);
+    posix_spawn_file_actions_addopen(&fa, 1, outf, O_WRONLY | O_CREAT | O_TRUNC, 0600);   /* curl prints the HTTP status to stdout */
+    if (posix_spawn(&pid, bin, &fa, NULL, is_curl ? argv_c : argv_w, envp)) { posix_spawn_file_actions_destroy(&fa); snprintf(err, ecap, "Cannot start %s", bin); return -1; }
+    posix_spawn_file_actions_destroy(&fa);
     int st = 0;
     waitpid(pid, &st, 0);
+    long hc = 0;
+    { FILE *cf = fopen(outf, "r"); if (cf) { if (fscanf(cf, "%ld", &hc) != 1) hc = 0; fclose(cf); } unlink(outf); }
     FILE *f = fopen(tmp, "rb");
     int ok = WIFEXITED(st) && WEXITSTATUS(st) == 0 && f;
+    if (is_curl && hc) { *code = hc; if (hc >= 400) ok = ok; }
     if (ok) {
         uint8_t chunk[16384];
         size_t r;
@@ -213,19 +248,24 @@ static int http_spawn(const char *url, buf_t *b, long timeout, char *err, size_t
     }
     if (f) fclose(f);
     unlink(tmp);
-    *code = ok ? 200 : 0;
+    if (!is_curl || !hc) *code = ok ? 200 : 0;
     if (!ok) snprintf(err, ecap, b->over ? "File too big" : "Download failed");
     return ok ? 0 : -1;
 }
 
-/* GET url into a new buffer; only http:// and https:// */
-static int http_get(const char *url, buf_t *b, size_t max, long timeout, char *err, size_t ecap, long *code) {
+/* GET (or POST a form) into a new buffer; only http:// and https://. On an error status the answer body stays in b for the caller to read. */
+static int http_req(const req_t *rq, const char *url, buf_t *b, size_t max, long timeout, char *err, size_t ecap, long *code) {
     memset(b, 0, sizeof *b);
     b->max = max;
     *code = 0;
     if (strncmp(url, "https://", 8) && strncmp(url, "http://", 7)) { snprintf(err, ecap, "Blocked address"); return -1; }
-    int rc = curl_load() ? http_curl(url, b, timeout, err, ecap, code) : http_spawn(url, b, timeout, err, ecap, code);
+    int rc = curl_load() ? http_curl(rq, url, b, timeout, err, ecap, code) : http_spawn(rq, url, b, timeout, err, ecap, code);
     if (rc == 0 && *code >= 400) { snprintf(err, ecap, "Server answered %ld", *code); rc = -1; }
+    if (rc && !b->d) { b->n = 0; }
+    return rc;
+}
+static int http_get(const char *url, buf_t *b, size_t max, long timeout, char *err, size_t ecap, long *code) {
+    int rc = http_req(NULL, url, b, max, timeout, err, ecap, code);
     if (rc) { free(b->d); b->d = NULL; b->n = 0; }
     return rc;
 }
@@ -514,6 +554,51 @@ static void urlenc(const char *in, char *out, size_t cap) {
 static int lic_ok(const char *l) { return !strcasecmp(l, "cc0") || !strcasecmp(l, "pdm"); }
 static int ext_ok(const char *e) { return !e[0] || !strcasecmp(e, "mp3") || !strcasecmp(e, "ogg") || !strcasecmp(e, "oga") || !strcasecmp(e, "wav"); }
 
+static const char *api_root(void) { const char *e = getenv("CRATE_ROOT"); return e && *e ? e : "https://api.openverse.org/v1/"; }
+
+static void urlenc(const char *in, char *out, size_t cap);
+
+/* the free Openverse account: client id and secret live in openverse.txt (two lines) next to the crate */
+static void account_load(void) {
+    char p[300];
+    LOCK(); snprintf(p, sizeof p, "%s/openverse.txt", G.base); UNLOCK();
+    FILE *f = fopen(p, "r");
+    if (!f) return;
+    char id[80] = "", sec[80] = "";
+    if (fgets(id, sizeof id, f)) id[strcspn(id, "\r\n")] = 0;
+    if (fgets(sec, sizeof sec, f)) sec[strcspn(sec, "\r\n")] = 0;
+    fclose(f);
+    LOCK(); snprintf(G.cid, sizeof G.cid, "%s", id); snprintf(G.csec, sizeof G.csec, "%s", sec); UNLOCK();
+}
+
+/* a bearer token for the account, or "" (anonymous). Fetched when missing or about to expire. */
+static void bearer_get(char *out, size_t cap) {
+    out[0] = 0;
+    char id[80], sec[80];
+    LOCK();
+    snprintf(id, sizeof id, "%s", G.cid); snprintf(sec, sizeof sec, "%s", G.csec);
+    if (G.tok[0] && mono() < G.tok_exp - 60) { snprintf(out, cap, "%s", G.tok); UNLOCK(); return; }
+    UNLOCK();
+    if (!id[0] || !sec[0]) return;
+    char url[300], post[300], ide[200], sece[200], err[100];
+    urlenc(id, ide, sizeof ide); urlenc(sec, sece, sizeof sece);
+    snprintf(url, sizeof url, "%sauth_tokens/token/", api_root());
+    snprintf(post, sizeof post, "grant_type=client_credentials&client_id=%s&client_secret=%s", ide, sece);
+    req_t rq = { post, NULL };
+    buf_t b;
+    long code;
+    if (http_req(&rq, url, &b, 1 << 16, 20, err, sizeof err, &code) == 0 && b.d) {
+        char tk[700];
+        val_str(obj_get((const char *)b.d, "access_token"), tk, sizeof tk);
+        double ex = val_num(obj_get((const char *)b.d, "expires_in"));
+        if (tk[0]) {
+            LOCK(); snprintf(G.tok, sizeof G.tok, "%s", tk); G.tok_exp = mono() + (ex > 0 ? ex : 3000); UNLOCK();
+            snprintf(out, cap, "%s", tk);
+        }
+    }
+    free(b.d);
+}
+
 typedef struct { int apage; } sjob_t;
 
 static void *job_search(void *arg) {
@@ -522,17 +607,21 @@ static void *job_search(void *arg) {
     char q[40], qe[120], url[600], err[100] = "";
     int cat, shortonly;
     LOCK(); snprintf(q, sizeof q, "%s", G.q); cat = G.cat; shortonly = G.shortonly; UNLOCK();
-    const char *api = getenv("CRATE_API");
     urlenc(q, qe, sizeof qe);
-    snprintf(url, sizeof url, "%s?q=%s&license=cc0,pdm&page_size=%d&page=%d&mature=false%s", api && *api ? api : "https://api.openverse.org/v1/audio/",
+    snprintf(url, sizeof url, "%saudio/?q=%s&license=cc0,pdm&page_size=%d&page=%d&mature=false%s", api_root(),
              qe, NRES, apage, cat == 1 ? "&category=sound_effect" : cat == 2 ? "&category=music" : "");
     status_set("Searching...");
+    char bearer[720];
+    bearer_get(bearer, sizeof bearer);
+    req_t rq = { NULL, bearer };
     buf_t b;
     long code;
-    if (http_get(url, &b, 4 << 20, 25, err, sizeof err, &code)) {
+    if (http_req(&rq, url, &b, 4 << 20, 25, err, sizeof err, &code)) {
         char m[160];
-        snprintf(m, sizeof m, "Search failed: %.100s", err);
+        if (code == 429) snprintf(m, sizeof m, bearer[0] ? "Openverse limit reached: wait a few minutes" : "Openverse limit reached: register a free account (ACCOUNT tab)");
+        else snprintf(m, sizeof m, "Search failed: %.100s", err);
         status_set(m);
+        free(b.d);
         atomic_store(&G.busy, 0);
         return NULL;
     }
@@ -738,17 +827,72 @@ static void *job_cplay(void *arg) {
 
 static void *job_test(void *arg) {
     (void)arg;
-    char err[100] = "", m[160];
+    char err[100] = "", m[160], url[300], bearer[720];
     buf_t b;
     long code;
-    const char *api = getenv("CRATE_API");
     status_set("Testing the connection...");
     int has = curl_load();
-    int rc = http_get(api && *api ? api : "https://api.openverse.org/v1/audio/?q=test&license=cc0&page_size=1", &b, 1 << 20, 25, err, sizeof err, &code);
-    LOCK();
-    snprintf(G.netinfo, sizeof G.netinfo, "%s: %s", has ? "libcurl" : "curl/wget program", rc ? err : "connection OK");
-    UNLOCK();
-    if (rc) snprintf(m, sizeof m, "Test failed: %.100s", err); else { snprintf(m, sizeof m, "Connection OK (%zu bytes)", b.n); free(b.d); }
+    bearer_get(bearer, sizeof bearer);
+    snprintf(url, sizeof url, "%srate_limit/", api_root());
+    req_t rq = { NULL, bearer };
+    int rc = http_req(&rq, url, &b, 1 << 16, 25, err, sizeof err, &code);
+    char info[160];
+    if (rc && code == 429) snprintf(info, sizeof info, "%s: online, but Openverse says too many requests", has ? "libcurl" : "curl/wget");
+    else if (rc && code == 401) snprintf(info, sizeof info, "%s: online, account not accepted", has ? "libcurl" : "curl/wget");
+    else if (rc) snprintf(info, sizeof info, "%s: %s", has ? "libcurl" : "curl/wget", err);
+    else {
+        char today[24] = "?";
+        const char *v = b.d ? obj_get((const char *)b.d, "requests_today") : NULL;
+        if (v) snprintf(today, sizeof today, "%d", (int)val_num(v));
+        const char *vf = b.d ? obj_get((const char *)b.d, "verified") : NULL;
+        snprintf(info, sizeof info, "%s: online. %s%s%s", has ? "libcurl" : "curl/wget", bearer[0] ? "Account " : "No account. ",
+                 bearer[0] ? (vf && !strncmp(vf, "true", 4) ? "verified" : "NOT verified yet") : "", bearer[0] ? "" : "");
+        (void)today;
+    }
+    free(b.d);
+    LOCK(); snprintf(G.netinfo, sizeof G.netinfo, "%s", info); UNLOCK();
+    snprintf(m, sizeof m, "%s", rc ? "Test: see INFO tab" : "Connection OK");
+    status_set(m);
+    atomic_store(&G.busy, 0);
+    return NULL;
+}
+
+/* the one-time free account: name, purpose and the typed e-mail address go to Openverse; the id and secret that come back are kept in openverse.txt */
+static void *job_register(void *arg) {
+    (void)arg;
+    char email[64], ee[200], nm[40], url[300], post[600], err[100], m[200];
+    LOCK(); snprintf(email, sizeof email, "%s", G.email); UNLOCK();
+    uint32_t rnd = (uint32_t)time(NULL) ^ (uint32_t)(mono() * 1000.0) ^ (uint32_t)(uintptr_t)&rnd;
+    FILE *ur = fopen("/dev/urandom", "rb");
+    if (ur) { if (fread(&rnd, 1, sizeof rnd, ur) != sizeof rnd) rnd ^= 0x9e3779b9u; fclose(ur); }
+    snprintf(nm, sizeof nm, "crate-digga-%08x", rnd);
+    urlenc(email, ee, sizeof ee);
+    snprintf(url, sizeof url, "%sauth_tokens/register/", api_root());
+    snprintf(post, sizeof post, "name=%s&description=Personal+tool+on+an+MPC+to+find+CC0+and+public+domain+sounds&email=%s", nm, ee);
+    req_t rq = { post, NULL };
+    buf_t b;
+    long code;
+    status_set("Registering...");
+    int rc = http_req(&rq, url, &b, 1 << 16, 30, err, sizeof err, &code);
+    if (rc == 0 && b.d) {
+        char id[80], sec[80];
+        val_str(obj_get((const char *)b.d, "client_id"), id, sizeof id);
+        val_str(obj_get((const char *)b.d, "client_secret"), sec, sizeof sec);
+        if (id[0] && sec[0]) {
+            char p[300];
+            LOCK(); snprintf(p, sizeof p, "%s/openverse.txt", G.base); UNLOCK();
+            int fd = open(p, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_CLOEXEC, 0600);
+            int ok = fd >= 0;
+            if (ok) { char line[200]; int n = snprintf(line, sizeof line, "%s\n%s\n", id, sec); ok = write(fd, line, (size_t)n) == n; close(fd); }
+            if (ok) {
+                LOCK(); snprintf(G.cid, sizeof G.cid, "%s", id); snprintf(G.csec, sizeof G.csec, "%s", sec); G.tok[0] = 0; UNLOCK();
+                snprintf(m, sizeof m, "Done. Open the e-mail from Openverse and tap its link, then press TEST");
+            } else snprintf(m, sizeof m, "Registered, but the key could not be saved");
+        } else snprintf(m, sizeof m, "Unexpected answer from Openverse");
+    } else if (code == 429) snprintf(m, sizeof m, "Openverse says too many requests: try again in a while");
+    else if (code == 400) snprintf(m, sizeof m, "Openverse refused the address: check the e-mail spelling");
+    else snprintf(m, sizeof m, "Register failed: %.100s", err);
+    free(b.d);
     status_set(m);
     atomic_store(&G.busy, 0);
     return NULL;
@@ -765,6 +909,16 @@ static int start_search(int apage) {
 
 /* ---------- the 16 pads: saved on the card (pads/padNN.wav + pads/pads.cfg), so they are back after a restart ---------- */
 
+static const int ATT_MS[] = { 0, 2, 5, 10, 20, 50, 100, 200, 500 };
+static const int DEC_MS[] = { 0, 50, 100, 200, 400, 800, 1500, 3000 };      /* 0 = off: the whole sample plays */
+static const int REL_MS[] = { 5, 20, 50, 100, 200, 400, 800, 1500 };
+#define N_ATT ((int)(sizeof ATT_MS / sizeof *ATT_MS))
+#define N_DEC ((int)(sizeof DEC_MS / sizeof *DEC_MS))
+#define N_REL ((int)(sizeof REL_MS / sizeof *REL_MS))
+#define N_GRP 9
+
+static void pc_default(void) { for (int i = 0; i < NPADS; i++) { G.pc[i].att = 0; G.pc[i].dec = 0; G.pc[i].rel = 1; G.pc[i].grp = 0; G.pc[i].mode = 0; } }
+
 static void cfg_save(void) {
     char dir[300], path[330], tmp[340];
     signed char map[128];
@@ -772,14 +926,15 @@ static void cfg_save(void) {
     if (!have) return;
     mkdir(dir, 0755);
     char names[NPADS][40];
+    unsigned char pcs[NPADS][5];
     pthread_mutex_lock(&G.padmu);
-    for (int i = 0; i < NPADS; i++) snprintf(names[i], sizeof names[i], "%s", G.pad[i].d ? G.pad[i].name : "");
+    for (int i = 0; i < NPADS; i++) { snprintf(names[i], sizeof names[i], "%s", G.pad[i].d ? G.pad[i].name : ""); pcs[i][0] = G.pc[i].att; pcs[i][1] = G.pc[i].dec; pcs[i][2] = G.pc[i].rel; pcs[i][3] = G.pc[i].grp; pcs[i][4] = G.pc[i].mode; }
     pthread_mutex_unlock(&G.padmu);
     snprintf(path, sizeof path, "%s/pads.cfg", dir);
     snprintf(tmp, sizeof tmp, "%s/pads.tmp", dir);
     FILE *f = fopen(tmp, "w");
     if (!f) return;
-    for (int i = 0; i < NPADS; i++) if (names[i][0]) fprintf(f, "name %d %s\n", i, names[i]);
+    for (int i = 0; i < NPADS; i++) { if (names[i][0]) fprintf(f, "name %d %s\n", i, names[i]); fprintf(f, "env %d %d %d %d %d %d\n", i, pcs[i][0], pcs[i][1], pcs[i][2], pcs[i][3], pcs[i][4]); }
     for (int n = 0; n < 128; n++) if (map[n] >= 0) fprintf(f, "map %d %d\n", n, map[n]);
     if (fclose(f) == 0) rename(tmp, path); else unlink(tmp);
 }
@@ -813,6 +968,14 @@ static void *boot_thread(void *a) {
             int i, nn;
             char nm[60];
             if (sscanf(line, "name %d %59[^\n]", &i, nm) == 2 && i >= 0 && i < NPADS) snprintf(names[i], sizeof names[i], "%s", nm);
+            else if (!strncmp(line, "env ", 4)) {
+                int pi, a, d, rl, g, md;
+                if (sscanf(line, "env %d %d %d %d %d %d", &pi, &a, &d, &rl, &g, &md) == 6 && pi >= 0 && pi < NPADS && a >= 0 && a < N_ATT && d >= 0 && d < N_DEC && rl >= 0 && rl < N_REL && g >= 0 && g < N_GRP) {
+                    pthread_mutex_lock(&G.padmu);
+                    G.pc[pi].att = (unsigned char)a; G.pc[pi].dec = (unsigned char)d; G.pc[pi].rel = (unsigned char)rl; G.pc[pi].grp = (unsigned char)g; G.pc[pi].mode = (unsigned char)(md ? 1 : 0);
+                    pthread_mutex_unlock(&G.padmu);
+                }
+            }
             else if (sscanf(line, "map %d %d", &nn, &i) == 2 && nn >= 0 && nn < 128 && i >= 0 && i < NPADS) { map[nn] = (signed char)i; have_map = 1; }
         }
         fclose(f);
@@ -870,8 +1033,11 @@ static void pad_assign(int p) {   /* the sound that was played last goes on pad 
 
 typedef struct {
     atomic_int trig[NPADS];
-    struct { int on; long pos; float gain; } voice[NPADS];
-    unsigned seen_gen; long pv_pos;
+    atomic_int rel[NPADS];            /* a note-off (hold mode) asks for the release */
+    atomic_int stop;                  /* the transport stopped */
+    struct { int on; long pos; float gain; long age, rage; } voice[NPADS];   /* rage < 0: not releasing */
+    unsigned seen_gen; long pv_pos; long pv_fade;
+    int was_playing;
     double born;
 } inst_t;
 
@@ -884,8 +1050,9 @@ static void *create(const char *dir) {
     if (!G.base[0]) make_dirs();
     G.refs++;
     int boot = !G.boot;
-    if (boot) { G.boot = 1; map_default(); }
+    if (boot) { G.boot = 1; map_default(); pc_default(); }
     UNLOCK();
+    if (boot) account_load();
     if (boot) {
         pthread_t t;
         pthread_attr_t at;
@@ -919,6 +1086,16 @@ static void pad_trigger(inst_t *s, int p, int vel) {
 
 static void midi(void *i, const uint8_t *m, int n) {
     inst_t *s = i;
+    if (n >= 3 && (m[0] & 0xF0) == 0x80) {   /* note off */
+        LOCK(); int p = G.padmap[m[1] & 127]; UNLOCK();
+        if (p >= 0) atomic_store(&s->rel[p], 1);
+        return;
+    }
+    if (n >= 3 && (m[0] & 0xF0) == 0x90 && m[2] == 0) {
+        LOCK(); int p = G.padmap[m[1] & 127]; UNLOCK();
+        if (p >= 0) atomic_store(&s->rel[p], 1);
+        return;
+    }
     if (n >= 3 && (m[0] & 0xF0) == 0x90 && m[2] > 0) {
         int note = m[1] & 127, p, learned = 0;
         char msg[100] = "";
@@ -935,10 +1112,20 @@ static void midi(void *i, const uint8_t *m, int n) {
             G.learn = 0; learned = 1;
         }
         p = G.padmap[note];
+        G.last_note = note; G.last_pad = p; G.rev++;
         UNLOCK();
         if (learned) { note_set(msg); cfg_save_async(); }
+        atomic_store(&s->rel[p < 0 ? 0 : p], 0);
         pad_trigger(s, p, m[2]);
     }
+}
+
+/* the host's transport: when it stops, every sound fades out, like the other sounds in the project */
+static void song_pos(void *inst, double ppq, double bpm, int playing, int frames) {
+    (void)ppq; (void)bpm; (void)frames;
+    inst_t *s = inst;
+    if (s->was_playing && !playing) atomic_store(&s->stop, 1);
+    s->was_playing = playing ? 1 : 0;
 }
 
 static int tap_repeat(const char *key) {   /* the MPC sends a tap twice now and then */
@@ -1007,6 +1194,50 @@ static void set_param(void *inst, const char *key, const char *val) {
         if (e) { note_set("Type a word first, or tap a preset"); return; }
         start_search(1);
         return;
+    }
+    if (key[0] == 'e' && key[1] == 'c' && isdigit((unsigned char)key[2])) {   /* a key of the e-mail keyboard on the ACCOUNT tab: 0-25 letters, 26-35 digits, 36 @, 37 ., 38 _, 39 - */
+        static const char EK[] = "qwertyuiopasdfghjklzxcvbnm0123456789@._-";
+        int n = atoi(key + 2);
+        if (n >= 0 && n < 40) { LOCK(); size_t l = strlen(G.email); if (l < sizeof G.email - 2) { G.email[l] = EK[n]; G.email[l + 1] = 0; G.rev++; } UNLOCK(); }
+        return;
+    }
+    if (!strcmp(key, "e_back")) { LOCK(); size_t l = strlen(G.email); if (l) G.email[l - 1] = 0; G.rev++; UNLOCK(); return; }
+    if (!strcmp(key, "e_clear")) { LOCK(); G.email[0] = 0; G.rev++; UNLOCK(); return; }
+    if (!strcmp(key, "register")) {
+        LOCK(); int ok = strchr(G.email, '@') && strchr(strchr(G.email, '@'), '.') && strlen(G.email) > 5; int has = G.cid[0]; UNLOCK();
+        if (!ok) { note_set("Type your e-mail address first"); return; }
+        if (has) { note_set("An account is already saved: press TEST"); return; }
+        if (atomic_exchange(&G.busy, 1)) { note_set("Busy, wait a moment"); return; }
+        spawn_job(job_register, NULL);
+        return;
+    }
+    if (!strcmp(key, "acc_forget")) {
+        char p[300];
+        LOCK(); snprintf(p, sizeof p, "%s/openverse.txt", G.base); G.cid[0] = 0; G.csec[0] = 0; G.tok[0] = 0; G.rev++; UNLOCK();
+        unlink(p);
+        note_set("Account key removed from this MPC");
+        return;
+    }
+    {   /* the envelope of the selected pad */
+        int which = 0, dir = 0;
+        if (!strcmp(key, "att_m")) { which = 1; dir = -1; } else if (!strcmp(key, "att_p")) { which = 1; dir = 1; }
+        else if (!strcmp(key, "dec_m")) { which = 2; dir = -1; } else if (!strcmp(key, "dec_p")) { which = 2; dir = 1; }
+        else if (!strcmp(key, "rel_m")) { which = 3; dir = -1; } else if (!strcmp(key, "rel_p")) { which = 3; dir = 1; }
+        else if (!strcmp(key, "grp_m")) { which = 4; dir = -1; } else if (!strcmp(key, "grp_p")) { which = 4; dir = 1; }
+        else if (!strcmp(key, "mode_t")) { which = 5; dir = 1; }
+        if (which) {
+            LOCK(); int p = G.pad_sel; UNLOCK();
+            pthread_mutex_lock(&G.padmu);
+            unsigned char *f = which == 1 ? &G.pc[p].att : which == 2 ? &G.pc[p].dec : which == 3 ? &G.pc[p].rel : which == 4 ? &G.pc[p].grp : &G.pc[p].mode;
+            int mx = which == 1 ? N_ATT : which == 2 ? N_DEC : which == 3 ? N_REL : which == 4 ? N_GRP : 2;
+            int nv = *f + dir;
+            if (which == 5) nv = (*f + 1) % 2;
+            if (nv >= 0 && nv < mx) *f = (unsigned char)nv;
+            pthread_mutex_unlock(&G.padmu);
+            LOCK(); G.rev++; UNLOCK();
+            cfg_save_async();
+            return;
+        }
     }
     if ((k = key_idx(key, "rt", ROWS))) { LOCK(); int i = G.rpage * ROWS + k - 1; UNLOCK(); play_result(i); return; }
     if (!strcmp(key, "r_prev")) {
@@ -1093,10 +1324,12 @@ static int put(char *b, int n, const char *s) { int r = snprintf(b, (size_t)n, "
 
 static int is_trigger(const char *key) {
     static const char *const fixed[] = { "k_space", "k_back", "k_clear", "do_search", "r_prev", "r_next", "pv_play", "keep", "to_pad", "c_prev", "c_next", "c_del",
-                                         "pad_clear", "learn_pad", "learn_base", "net_test" };
+                                         "pad_clear", "learn_pad", "learn_base", "net_test", "e_back", "e_clear", "register", "acc_forget",
+                                         "att_m", "att_p", "dec_m", "dec_p", "rel_m", "rel_p", "grp_m", "grp_p", "mode_t" };
     for (size_t i = 0; i < sizeof fixed / sizeof *fixed; i++) if (!strcmp(key, fixed[i])) return 1;
     return (key[0] == 'k' && key[1] == 'c' && isdigit((unsigned char)key[2])) || key_idx(key, "pq", NQUICK) || key_idx(key, "rt", ROWS) ||
-           key_idx(key, "ct", ROWS) || key_idx(key, "pd", NPADS);
+           key_idx(key, "ct", ROWS) || key_idx(key, "pd", NPADS) ||
+           (key[0] == 'e' && key[1] == 'c' && isdigit((unsigned char)key[2]));
 }
 
 static int get_param(void *inst, const char *key, char *b, int n) {
@@ -1215,6 +1448,34 @@ static int get_param(void *inst, const char *key, char *b, int n) {
         UNLOCK();
         return put(b, n, t);
     }
+    if (!strcmp(key, "email_txt")) { LOCK(); snprintf(t, sizeof t, "%s_", G.email); UNLOCK(); return put(b, n, t); }
+    if (!strcmp(key, "acc_txt")) {
+        LOCK();
+        if (G.cid[0]) snprintf(t, sizeof t, "Account saved on this MPC");
+        else snprintf(t, sizeof t, "No account yet: searches are limited");
+        UNLOCK();
+        return put(b, n, t);
+    }
+    if (!strcmp(key, "last_txt")) {
+        LOCK();
+        if (G.last_note < 0) snprintf(t, sizeof t, "Last MIDI note: none yet (hit a pad)");
+        else if (G.last_pad >= 0) snprintf(t, sizeof t, "Last MIDI note: %d = pad %d", G.last_note, G.last_pad + 1);
+        else snprintf(t, sizeof t, "Last MIDI note: %d (no pad: use LEARN)", G.last_note);
+        UNLOCK();
+        return put(b, n, t);
+    }
+    if (!strcmp(key, "att_txt") || !strcmp(key, "dec_txt") || !strcmp(key, "rel_txt") || !strcmp(key, "grp_txt") || !strcmp(key, "mode_txt")) {
+        LOCK(); int p = G.pad_sel; UNLOCK();
+        pthread_mutex_lock(&G.padmu);
+        int a = G.pc[p].att, d = G.pc[p].dec, rl = G.pc[p].rel, g = G.pc[p].grp, md = G.pc[p].mode;
+        pthread_mutex_unlock(&G.padmu);
+        if (key[0] == 'a') snprintf(t, sizeof t, "%d ms", ATT_MS[a]);
+        else if (key[0] == 'd') { if (DEC_MS[d]) snprintf(t, sizeof t, "%d ms", DEC_MS[d]); else snprintf(t, sizeof t, "OFF"); }
+        else if (key[0] == 'r') snprintf(t, sizeof t, "%d ms", REL_MS[rl]);
+        else if (key[0] == 'g') { if (g) snprintf(t, sizeof t, "GROUP %d", g); else snprintf(t, sizeof t, "NONE"); }
+        else snprintf(t, sizeof t, "%s", md ? "HOLD" : "ONE SHOT");
+        return put(b, n, t);
+    }
     if (!strcmp(key, "dir_txt")) { LOCK(); disp_text(t, sizeof t, G.base, 60); UNLOCK(); return put(b, n, t); }
     if (!strcmp(key, "display_rev")) {
         LOCK();
@@ -1223,7 +1484,7 @@ static int get_param(void *inst, const char *key, char *b, int n) {
         unsigned h = G.rev * 2654435761u + (unsigned)G.pad_sel * 31u + (unsigned)G.learn * 7u + fm + (unsigned)atomic_load(&G.busy) * 101u + (unsigned)G.cat * 13u + (unsigned)G.shortonly * 17u + (unsigned)G.pv_valid * 19u + (unsigned)G.pv_kept * 23u;
         UNLOCK();
         pthread_mutex_lock(&G.padmu);
-        for (int i = 0; i < NPADS; i++) h = h * 31u + (G.pad[i].d ? (unsigned)G.pad[i].frames : 0u);
+        for (int i = 0; i < NPADS; i++) h = h * 31u + (G.pad[i].d ? (unsigned)G.pad[i].frames : 0u) + G.pc[i].att * 3u + G.pc[i].dec * 5u + G.pc[i].rel * 7u + G.pc[i].grp * 11u + G.pc[i].mode * 13u;
         pthread_mutex_unlock(&G.padmu);
         double now = mono();
         LOCK(); h += (G.note[0] && now - G.note_t < 10.0) ? 1u : 0u; h += (G.status[0] && now - G.status_t < 120.0) ? 2u : 0u; UNLOCK();
@@ -1232,37 +1493,55 @@ static int get_param(void *inst, const char *key, char *b, int n) {
     return 0;
 }
 
-/* the preview and the pads, mixed in 16 bit; a busy lock skips one block rather than waiting on the audio thread */
+/* the preview and the pads, mixed in 16 bit; a busy lock skips one block rather than waiting on the audio thread.
+ * Each pad voice has an envelope: attack ramp, optional decay to silence, and a release after a note-off (hold mode), a mute-group choke or STOP. */
 static void render(void *inst, int16_t *out, int frames) {
     inst_t *s = inst;
     memset(out, 0, (size_t)frames * 4);
     if (pthread_mutex_trylock(&G.padmu) != 0) return;
-    if (s->seen_gen != G.pv_gen) { s->seen_gen = G.pv_gen; s->pv_pos = 0; }
+    int stopreq = atomic_exchange(&s->stop, 0);
+    if (stopreq) s->pv_fade = s->pv_fade ? s->pv_fade : 882;
+    if (s->seen_gen != G.pv_gen) { s->seen_gen = G.pv_gen; s->pv_pos = 0; s->pv_fade = 0; }
     if (G.pv && G.pv_play && s->pv_pos < G.pv_frames) {
         long pos = s->pv_pos;
         for (int i = 0; i < frames && pos < G.pv_frames; i++, pos++) {
-            out[2 * i] = (int16_t)(G.pv[2 * pos] * 0.8f);
-            out[2 * i + 1] = (int16_t)(G.pv[2 * pos + 1] * 0.8f);
+            float g = 0.8f;
+            if (s->pv_fade) { g *= (float)s->pv_fade / 882.0f; if (--s->pv_fade == 0) { pos = G.pv_frames; } }
+            out[2 * i] = (int16_t)(G.pv[2 * pos] * g);
+            out[2 * i + 1] = (int16_t)(G.pv[2 * pos + 1] * g);
         }
         s->pv_pos = pos;
     }
     for (int p = 0; p < NPADS; p++) {
         int vel = atomic_exchange(&s->trig[p], 0);
-        if (vel && G.pad[p].d) { s->voice[p].on = 1; s->voice[p].pos = 0; s->voice[p].gain = (float)vel / 127.0f; }
+        if (vel && G.pad[p].d) {
+            int g = G.pc[p].grp;
+            if (g) for (int q = 0; q < NPADS; q++) if (q != p && G.pc[q].grp == g && s->voice[q].on && s->voice[q].rage < 0) s->voice[q].rage = 0;   /* mute group: the others let go */
+            s->voice[p].on = 1; s->voice[p].pos = 0; s->voice[p].age = 0; s->voice[p].rage = -1; s->voice[p].gain = (float)vel / 127.0f;
+        }
+        if (atomic_exchange(&s->rel[p], 0) && G.pc[p].mode == 1 && s->voice[p].on && s->voice[p].rage < 0) s->voice[p].rage = 0;
+        if (stopreq && s->voice[p].on && s->voice[p].rage < 0) s->voice[p].rage = 0;
         if (!s->voice[p].on || !G.pad[p].d) continue;
         const int16_t *d = G.pad[p].d;
-        long pos = s->voice[p].pos, total = G.pad[p].frames;
-        float g = s->voice[p].gain * 0.9f;
-        for (int i = 0; i < frames && pos < total; i++, pos++) {
-            int a = out[2 * i] + (int)(d[2 * pos] * g), c = out[2 * i + 1] + (int)(d[2 * pos + 1] * g);
+        long pos = s->voice[p].pos, total = G.pad[p].frames, age = s->voice[p].age, rage = s->voice[p].rage;
+        long att = (long)ATT_MS[G.pc[p].att] * 44100 / 1000, dec = (long)DEC_MS[G.pc[p].dec] * 44100 / 1000, rel = (long)REL_MS[G.pc[p].rel] * 44100 / 1000;
+        if (rel < 1) rel = 1;
+        float gain = s->voice[p].gain * 0.9f;
+        for (int i = 0; i < frames; i++, pos++, age++) {
+            if (pos >= total) { s->voice[p].on = 0; break; }
+            float e = 1.0f;
+            if (att > 0 && age < att) e = (float)age / (float)att;
+            if (dec > 0) { long da = age - att; if (da < 0) da = 0; if (da >= dec) { s->voice[p].on = 0; break; } e *= 1.0f - (float)da / (float)dec; }
+            if (rage >= 0) { if (rage >= rel) { s->voice[p].on = 0; break; } e *= 1.0f - (float)rage / (float)rel; rage++; }
+            float g2 = gain * e;
+            int a = out[2 * i] + (int)(d[2 * pos] * g2), c = out[2 * i + 1] + (int)(d[2 * pos + 1] * g2);
             out[2 * i] = (int16_t)(a > 32767 ? 32767 : a < -32768 ? -32768 : a);
             out[2 * i + 1] = (int16_t)(c > 32767 ? 32767 : c < -32768 ? -32768 : c);
         }
-        s->voice[p].pos = pos;
-        if (pos >= total) s->voice[p].on = 0;
+        s->voice[p].pos = pos; s->voice[p].age = age; s->voice[p].rage = rage;
     }
     pthread_mutex_unlock(&G.padmu);
 }
 
-static const mpc_engine_t ENGINE = { create, destroy, midi, set_param, get_param, render, NULL, NULL };
+static const mpc_engine_t ENGINE = { create, destroy, midi, set_param, get_param, render, NULL, song_pos };
 const mpc_engine_t *mpc_engine(void) { return &ENGINE; }

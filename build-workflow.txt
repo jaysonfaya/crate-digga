@@ -1,4 +1,4 @@
-# Baut Crate Digga 1.0 (JJ DA PLUG) für die MPC und legt die fertige ZIP-Datei als Download bereit.
+# Baut Crate Digga 1.1 (JJ DA PLUG) für die MPC und legt die fertige ZIP-Datei als Download bereit.
 # Start: Reiter "Actions" -> "Build Crate Digga" -> "Run workflow". Danach die ZIP unter "Artifacts" herunterladen.
 name: Build Crate Digga
 on:
@@ -11,8 +11,8 @@ jobs:
     permissions:
       contents: write
     with:
-      tag: crate-digga-v1.0.0
-      version: 1.0.0
+      tag: crate-digga-v1.1.0
+      version: 1.1.0
       tools_ref: 28038025aa91f24ff9a52e831df236b435c6ef87
       vst_dir: "."
       build: bash build.sh

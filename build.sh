@@ -4,5 +4,6 @@
 set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 [ -x "${MPC_VST:-/nonexistent}/tools/build_port.sh" ] || { echo "MPC_VST muss auf einen Ordner mit mpc-vst-plugins zeigen" >&2; exit 1; }
+python3 -c "import fontTools" 2>/dev/null || python3 -m pip install --quiet --break-system-packages fonttools 2>/dev/null || python3 -m pip install --quiet fonttools
 python3 "$here/gen_ui.py"
 exec "$MPC_VST/tools/build_port.sh" "$here/vst.json"
