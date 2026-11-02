@@ -19,4 +19,3 @@ jobs:
       host_test: '"$MPC_VST/tools/test_port.sh" vst.json'
       about: CRATE DIGGA von JJ DA PLUG - sucht freie Sounds (nur CC0 und Public Domain) im Internet Archive, bei Wikimedia und Openverse, spielt sie an, speichert sie im Crate und legt sie auf 64 Pads.
       dry_run: true
- 
