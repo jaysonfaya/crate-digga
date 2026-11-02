@@ -7,7 +7,7 @@ permissions:
   contents: read
 jobs:
   build:
-    uses: sd88me/mpc-vst-plugins/.github/workflows/vst-release.yml@35257c5cfab2d5b8a2ef3f75a98fe1cb00b669d5
+    uses: open-mpc/mpc-vst-plugins/.github/workflows/vst-release.yml@35257c5cfab2d5b8a2ef3f75a98fe1cb00b669d5
     permissions:
       contents: write
     with:
