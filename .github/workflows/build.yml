@@ -7,13 +7,13 @@ permissions:
   contents: read
 jobs:
   build:
-    uses: sd88me/mpc-vst-plugins/.github/workflows/vst-release.yml@main
+    uses: open-mpc/mpc-vst-plugins/.github/workflows/vst-release.yml@35257c5cfab2d5b8a2ef3f75a98fe1cb00b669d5
     permissions:
       contents: write
     with:
       tag: crate-digga-v1.8.0
       version: 1.8.0
-      tools_ref: main
+      tools_ref: 35257c5cfab2d5b8a2ef3f75a98fe1cb00b669d5
       vst_dir: "."
       build: bash build.sh
       host_test: '"$MPC_VST/tools/test_port.sh" vst.json'
