@@ -11,8 +11,8 @@ jobs:
     permissions:
       contents: write
     with:
-      tag: crate-digga-v1.7.0
-      version: 1.7.0
+      tag: crate-digga-v1.8.0
+      version: 1.8.0
       tools_ref: 28038025aa91f24ff9a52e831df236b435c6ef87
       vst_dir: "."
       build: bash build.sh
