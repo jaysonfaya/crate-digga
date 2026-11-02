@@ -16,7 +16,7 @@ AMBER, AMBER2, SILVER, GREY, DIM = "#ffb52e", "#c98410", "#e9e7e0", "#9a968c", "
 KEYS = "qwertyuiopasdfghjklzxcvbnm"
 EKEYS = "qwertyuiopasdfghjklzxcvbnm0123456789@._-"
 QUICK = ["jazz", "funk", "soul", "film", "blues", "ambient", "cartoon", "drums"]
-VERSION_TXT = "1.7"
+VERSION_TXT = "1.8"
 
 # ------------------------------------------------------------------ params (v1.0 order first, new ones appended at the end)
 P = []
@@ -65,7 +65,7 @@ for i in range(NEV): P.append({"key": "ev%d" % i, "name": "Envelope %d" % i, "mi
 for t, n in [("bk1", "Bank A"), ("bk2", "Bank B"), ("bk3", "Bank C"), ("bk4", "Bank D")]: trig(t, n)
 for t, n in [("bt1", "Bank A text"), ("bt2", "Bank B text"), ("bt3", "Bank C text"), ("bt4", "Bank D text"), ("pmode_txt", "Mode"), ("rep_txt", "Replace"), ("undo_txt", "Undo"), ("ops_txt", "Pad action")]: ro(t, n)
 for t, n in [("pmode_t", "Play record select"), ("rec_replace", "Replace"), ("op_copy", "Copy pad"), ("op_move", "Move pad"), ("op_swap", "Swap pads"), ("op_del", "Delete pad"),
-             ("sel_all", "Mark all"), ("undo", "Undo"), ("bk_copy", "Copy bank"), ("bk_move", "Move bank"), ("bk_swap", "Swap bank"), ("bk_clear", "Clear bank")]: trig(t, n)
+             ("sel_all", "Mark all"), ("undo", "Undo"), ("bk_copy", "Copy bank"), ("bk_move", "Move bank"), ("bk_swap", "Swap bank"), ("bk_clear", "Clear bank"), ("clr_pads", "Clear pads"), ("clr_ok", "Clear confirm"), ("clr_no", "Clear cancel")]: trig(t, n)
 json.dump({"name": "Crate Digga", "params": P}, open(OUT + "/params.json", "w"), indent=1)
 
 # ================================================================== look: black sticker, white hand-drawn lines, gold, own dog and cat
@@ -368,6 +368,9 @@ for _k, _l, _sz in (("opcopy", "COPY", 30), ("opmove", "MOVE", 30), ("opswap", "
                     ("bkcopy", "BANK COPY", 24), ("bkmove", "BANK MOVE", 24), ("bkswap", "BANK SWAP", 24), ("bkclear", "BANK CLEAR", 24)):
     pair(_k, 116 if _k.startswith("op") else 142, 50, _l, _sz)
 pair("stopall2", 142, 50, "STOP ALL", 28, "silver")
+pair("clrpads", 142, 50, "CLEAR PADS", 24)
+pair("clrok", 112, 38, "CONFIRM", 24, "silver")
+pair("clrno", 100, 38, "CANCEL", 24)
 pair("edplay2", 200, 46, "PLAY PAD", 30, "silver")
 pair("stopall", 300, 56, "STOP ALL", 38, "silver")
 pair("edplay", 300, 56, "PLAY PAD", 38, "silver")
@@ -380,7 +383,7 @@ def dots(cx, cy, w, h):
 DOTS = {"lbl_search": [(330, 672, 600, 28), (880, 612, 440, 32), (1185, 612, 150, 32)],
         "lbl_crate": [(500, 540, 100, 26), (790, 584, 500, 32), (1145, 584, 190, 32), (890, 622, 700, 28)],
         
-        "lbl_sample": [(950, 222, 592, 28), (330, 662, 600, 26), (330, 692, 600, 24), (800, 482, 290, 26), (990, 536, 110, 38)], "lbl_info": [(1000, 640, 440, 36), (750, 684, 1000, 28)]}
+        "lbl_sample": [(950, 222, 592, 28), (245, 662, 380, 26), (330, 692, 600, 24), (800, 482, 290, 26), (990, 536, 110, 38)], "lbl_info": [(1000, 640, 440, 36), (750, 684, 1000, 28)]}
 def overlay(name, parts): svg(name, 1280, 628, "".join(parts) + "".join(dots(*d) for d in DOTS.get(name, [])))
 def L(s, x, y, size=18, fill="#a8a49a", anchor="start", sp=2, fn="BebasNeue"): return txc(s, x, y - 86, size, fill, anchor, fn, sp)
 overlay("lbl_search", [L("SHORT ONLY", 1160, 266, 14, INK, "middle", 2)])
@@ -402,7 +405,7 @@ info = [("CRATE DIGGA  V" + VERSION_TXT, 40, GOLD), ("BY JJ-LEMMING  -  JJ DA PL
         ("EVERY KEPT SOUND GETS A TEXT FILE: TITLE, CREATOR, LICENSE, SOURCE.", 20, "#cfcbc0"), ("", 0, 0),
         ("PADS AND DECK", 26, GOLD),
         ("PADS = MIDI NOTES 36-99 (BANK A 36-51, B 52-67, C 68-83, D 84-99). STOP ENDS EVERYTHING.", 20, "#cfcbc0"),
-        ("SAMPLE TAB: MODE = RECORD, THEN HOLD A PAD WHILE THE PLAYER RUNS. EDIT RIGHT THERE.", 20, "#cfcbc0"), ("", 0, 0),
+        ("SAMPLE TAB: MODE AUTO = EMPTY PAD RECORDS WHILE HELD, FILLED PAD PLAYS. CLEAR PADS = FIRST + LAST PAD.", 20, "#cfcbc0"), ("", 0, 0),
         ("NO ACCOUNT NEEDED. EMPTY SEARCH OR NO MATCH = FREE PICKS. ONLY THE START OF LONG FILES IS LOADED.", 20, "#cfcbc0")]
 parts = []; y = 214
 for s_, sz, col in info:
@@ -492,13 +495,15 @@ for c in range(4):
     add("button cx=%d cy=462 label=\"\" key=bk%d get=bt%d tsize=22 tweight=bold tcolor=ffb52e talign=center img=images/b_dyn.svg img_on=images/b_dyn_on.svg w=140 h=48" % (96 + c * 146, c + 1, c + 1))
 for c, (k, im) in enumerate((("op_copy", "opcopy"), ("op_move", "opmove"), ("op_swap", "opswap"), ("op_del", "opdel"), ("sel_all", "opall"))):
     btn(k, 70 + c * 118, 514, 114, 48, im)
-for c, (k, im) in enumerate((("bk_copy", "bkcopy"), ("bk_move", "bkmove"), ("bk_swap", "bkswap"), ("bk_clear", "bkclear"))):
+for c, (k, im) in enumerate((("bk_copy", "bkcopy"), ("bk_move", "bkmove"), ("bk_swap", "bkswap"), ("clr_pads", "clrpads"))):
     btn(k, 96 + c * 146, 566, 140, 48, im)
 add("button cx=96 cy=618 label=\"\" key=pmode_t get=pmode_txt tsize=19 tweight=bold tcolor=ffb52e talign=center img=images/b_dyn.svg img_on=images/b_dyn_on.svg w=140 h=48")
 add("button cx=242 cy=618 label=\"\" key=rec_replace get=rep_txt tsize=19 tweight=bold tcolor=ffb52e talign=center img=images/b_dyn.svg img_on=images/b_dyn_on.svg w=140 h=48")
 add("button cx=388 cy=618 label=\"\" key=undo get=undo_txt tsize=22 tweight=bold tcolor=ffb52e talign=center img=images/b_dyn.svg img_on=images/b_dyn_on.svg w=140 h=48")
 btn("stop_all", 534, 618, 140, 48, "stopall2")
-ro_("ops_txt", 330, 662, 600, 26, 20, "e9e7e0", "left", "semibold")
+btn("clr_ok", 486, 664, 112, 38, "clrok")
+btn("clr_no", 598, 664, 100, 38, "clrno")
+ro_("ops_txt", 245, 662, 380, 26, 20, "e9e7e0", "left", "semibold")
 ro_("note_txt", 330, 692, 600, 24, 18, "ffb52e", "left", "semibold")
 ro_("ed_pad_txt", 950, 222, 592, 28, 20, "e9e7e0", "left", "semibold")
 add("slider_h cx=950 cy=262 w=592 h=38 label=\"\" key=ed_start img=images/ed_thumb.png base=images/ed_track_s.png ns=0 vs=0 bw=592")
@@ -524,7 +529,7 @@ ro_("dir_txt", 750, 684, 1000, 28, 20, "9a968c", "left")
 q()
 open(OUT + "/layout.conf", "w").write("\n".join(Lc) + "\n")
 
-json.dump({"name": "Crate Digga", "vendor": "JJ DA PLUG", "uid": "CrDg", "version": 170, "so": "crate.so", "params": "params.json",
+json.dump({"name": "Crate Digga", "vendor": "JJ DA PLUG", "uid": "CrDg", "version": 180, "so": "crate.so", "params": "params.json",
            "layout": "layout.conf", "art": "html", "defines": {"PARAM_TEXT_MAX": 128, "HAS_DISPLAY_REV": 1, "HAS_SONG_POS": 1},
            "build": {"root": ".", "sources": ["crate.c", "vorbis_glue.c"], "cflags": ["-I."], "libs": ["-lpthread", "-lm", "-ldl"]}},
           open(OUT + "/vst.json", "w"), indent=1)

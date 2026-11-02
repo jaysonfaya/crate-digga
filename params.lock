@@ -357,3 +357,6 @@ bk_copy
 bk_move
 bk_swap
 bk_clear
+clr_pads
+clr_ok
+clr_no

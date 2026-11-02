@@ -90,7 +90,7 @@ static struct {
     cfile_t cr[200]; int ncr, cpage, csel;
     slot_t pad[NPADS];
     char dirty[NPADS]; unsigned slotver;           /* dirty: the pad's wav file must be written / removed; slotver: any slot changed */
-    int bank, pmode, pend, pend_bk, replace; unsigned long long selmask;   /* SAMPLE tab: bank 0-3, mode 0 play / 1 record / 2 select, pending pad op (1 copy 2 move 3 swap), pending bank op, REPLACE armed */
+    int clr, clr_first, clr_last; int bank, pmode, pend, pend_bk, replace; unsigned long long selmask;   /* SAMPLE tab: bank 0-3, mode 0 play / 1 record / 2 select, pending pad op (1 copy 2 move 3 swap), pending bank op, REPLACE armed */
     snap_t *undo[NUNDO]; int nundo;
     int rec_pad;
     int pad_sel; signed char padmap[128]; int learn;
@@ -101,7 +101,7 @@ static struct {
     atomic_int verifying, quit, workers;
     int wv_sel, wv_frames; unsigned wv_ver; const int16_t *wv_ptr; unsigned char wv[80]; int cfg_dirty; double cfg_dirty_t;   /* waveform columns of the pad shown in the editor */
     char email[64], cid[80], csec[80], tok[700]; double tok_exp;     /* the Openverse account */
-} G = { .mu = PTHREAD_MUTEX_INITIALIZER, .padmu = PTHREAD_MUTEX_INITIALIZER, .netmu = PTHREAD_MUTEX_INITIALIZER, .rsel = -1, .csel = -1, .apage = 1, .shortonly = 1, .last_note = -1, .last_pad = -1 };
+} G = { .mu = PTHREAD_MUTEX_INITIALIZER, .padmu = PTHREAD_MUTEX_INITIALIZER, .netmu = PTHREAD_MUTEX_INITIALIZER, .rsel = -1, .csel = -1, .apage = 1, .shortonly = 1, .last_note = -1, .last_pad = -1, .pmode = 3, .clr_first = -1 };
 
 /* the turntable: pitch fader, range, key lock, scratch slider, platter picture (frame number of the filmstrip) */
 #define NPLAT 24
@@ -1477,7 +1477,7 @@ static void destroy(void *i) {
         pthread_mutex_lock(&G.padmu);
         for (int k = 0; k < NPADS; k++) { smp_drop(G.pad[k].sm); G.pad[k].sm = NULL; G.pad[k].d = NULL; G.pad[k].frames = 0; G.pad[k].name[0] = 0; G.dirty[k] = 0; }
         for (int k = 0; k < NUNDO; k++) { snap_free(G.undo[k]); G.undo[k] = NULL; }
-        G.nundo = 0; G.slotver++; G.bank = 0; G.pmode = 0; G.pend = 0; G.pend_bk = 0; G.replace = 0; G.selmask = 0;
+        G.nundo = 0; G.slotver++; G.bank = 0; G.pmode = 3; G.clr = 0; G.pend = 0; G.pend_bk = 0; G.replace = 0; G.selmask = 0;
         free(G.pv); G.pv = NULL; G.pv_frames = 0; G.pv_play = 0;
         pthread_mutex_unlock(&G.padmu);
     }
@@ -1759,19 +1759,41 @@ static void rec_poll(inst_t *s) { if (atomic_load(&s->rdone)) rec_finalize(s); }
 
 static void sel_toggle(int p) { LOCK(); G.selmask ^= 1ULL << p; G.rev++; UNLOCK(); }
 
+static void clear_range(int first) {   /* empties 16 slots inside Crate Digga: no audio file of the MPC, no project, no other bank is touched */
+    pthread_mutex_lock(&G.padmu);
+    undo_push_l();
+    for (int k = 0; k < NVIS && first + k < NPADS; k++) { slot_clear_l(first + k); pc_default_one(first + k); }
+    pthread_mutex_unlock(&G.padmu);
+    char t[80]; snprintf(t, sizeof t, "Pads %d-%d cleared (UNDO brings them back)", first + 1, first + NVIS);
+    sync_note(t);
+}
+
 static void pad_press(inst_t *s, int p, int down, int vel) {   /* an on-screen pad or a hardware pad; p is the absolute pad number */
-    LOCK(); int mode = G.pmode, pend = G.pend; UNLOCK();
+    LOCK(); int mode = G.pmode, pend = G.pend, clr = G.clr; UNLOCK();
     if (!down) {
-        if (mode == 1 && atomic_load(&s->ron) && s->rpad == p) atomic_store(&s->rstop, 1);
-        else if (mode == 0) atomic_store(&s->rel[p], 1);
+        if (atomic_load(&s->ron) && s->rpad == p) atomic_store(&s->rstop, 1);
+        else if (mode == 0 || mode == 3) atomic_store(&s->rel[p], 1);
         return;
     }
     LOCK(); G.pad_sel = p; G.bank = p / NVIS; G.rev++; UNLOCK();
+    if (clr == 1) { LOCK(); G.clr_first = p; G.clr = 2; G.rev++; UNLOCK(); note_set("PRESS LAST PAD (the 16th pad of the group)"); return; }
+    if (clr == 2) {
+        LOCK(); int f = G.clr_first; UNLOCK();
+        int lo = f < p ? f : p, hi = f < p ? p : f;
+        if (lo % NVIS == 0 && hi == lo + NVIS - 1) { LOCK(); G.clr_first = lo; G.clr = 3; G.rev++; UNLOCK(); note_set("CLEAR SELECTED PADS? Press CONFIRM or CANCEL"); }
+        else { LOCK(); G.clr = 0; G.rev++; UNLOCK(); note_set("Not a full group of 16 pads: nothing was cleared"); }
+        return;
+    }
+    if (clr == 3) return;
     if (pend) { pad_op(pend, p); return; }
+    if (mode == 3) {   /* AUTO: an empty pad records, a filled pad plays */
+        pthread_mutex_lock(&G.padmu); int occ = G.pad[p].sm != NULL; pthread_mutex_unlock(&G.padmu);
+        mode = occ ? 0 : 1;
+    }
     if (mode == 0) { atomic_store(&s->rel[p], 0); pad_trigger(s, p, vel); }
     else if (mode == 1) {
         if (atomic_load(&s->ron) && s->rpad == p) { if (mono() - s->rt0 > 0.3) atomic_store(&s->rstop, 1); }   /* no release event: the second tap ends the take */
-        else rec_begin(s, p);
+        else if (!atomic_load(&s->ron)) rec_begin(s, p);
     } else sel_toggle(p);
 }
 
@@ -1825,9 +1847,9 @@ static void set_param(void *inst, const char *key, const char *val) {
         return;
     }
     if (!strcmp(key, "pmode_t")) {
-        LOCK(); G.pmode = (G.pmode + 1) % 3; G.pend = 0; G.pend_bk = 0; int md = G.pmode; G.rev++; UNLOCK();
-        if (md != 1) atomic_store(&s->rstop, 1);
-        note_set(md == 0 ? "PLAY: pads play their samples" : md == 1 ? "RECORD: hold a pad while the player runs" : "SELECT: tap pads to mark them for COPY / MOVE / SWAP / DELETE");
+        LOCK(); G.pmode = G.pmode == 3 ? 0 : G.pmode == 0 ? 1 : G.pmode == 1 ? 2 : 3; G.pend = 0; G.pend_bk = 0; G.clr = 0; int md = G.pmode; G.rev++; UNLOCK();
+        if (md != 1 && md != 3) atomic_store(&s->rstop, 1);
+        note_set(md == 3 ? "AUTO: an empty pad records while held, a filled pad plays" : md == 0 ? "PLAY: pads play their samples" : md == 1 ? "RECORD: hold a pad while the player runs" : "SELECT: tap pads to mark them for COPY / MOVE / SWAP / DELETE");
         return;
     }
     if (!strcmp(key, "rec_replace")) { LOCK(); G.replace = !G.replace; int r = G.replace; G.rev++; UNLOCK(); note_set(r ? "REPLACE on: the next take may overwrite a filled pad" : "REPLACE off"); return; }
@@ -1846,6 +1868,17 @@ static void set_param(void *inst, const char *key, const char *val) {
         return;
     }
     if (!strcmp(key, "undo")) { do_undo(); return; }
+    if (!strcmp(key, "clr_pads")) {
+        LOCK(); G.clr = G.clr ? 0 : 1; G.pend = 0; G.pend_bk = 0; int c = G.clr; G.rev++; UNLOCK();
+        note_set(c ? "PRESS FIRST PAD (the first pad of the group)" : "Cancelled");
+        return;
+    }
+    if (!strcmp(key, "clr_no")) { LOCK(); G.clr = 0; G.rev++; UNLOCK(); note_set("Cancelled: nothing was cleared"); return; }
+    if (!strcmp(key, "clr_ok")) {
+        LOCK(); int c = G.clr, f = G.clr_first; if (c == 3) G.clr = 0; G.rev++; UNLOCK();
+        if (c == 3 && f >= 0 && f % NVIS == 0 && f + NVIS <= NPADS) clear_range(f); else note_set("Nothing to confirm: press CLEAR PADS first");
+        return;
+    }
     if (!strcmp(key, "bk_copy") || !strcmp(key, "bk_move") || !strcmp(key, "bk_swap")) {
         int kind = key[3] == 'c' ? 1 : key[3] == 'm' ? 2 : 3;
         LOCK(); G.pend_bk = G.pend_bk == kind ? 0 : kind; G.pend = 0; int pd = G.pend_bk; G.rev++; UNLOCK();
@@ -1991,7 +2024,7 @@ static int put(char *b, int n, const char *s) { int r = snprintf(b, (size_t)n, "
 
 static int is_trigger(const char *key) {
     static const char *const fixed[] = { "k_space", "k_back", "k_clear", "do_search", "r_prev", "r_next", "pv_play", "keep", "to_pad", "c_prev", "c_next", "c_del",
-                                         "pad_clear", "pmode_t", "rec_replace", "op_copy", "op_move", "op_swap", "op_del", "sel_all", "undo", "bk_copy", "bk_move", "bk_swap", "bk_clear", "learn_pad", "learn_base", "net_test", "e_back", "e_clear", "register", "acc_forget",
+                                         "pad_clear", "pmode_t", "rec_replace", "op_copy", "op_move", "op_swap", "op_del", "sel_all", "undo", "clr_pads", "clr_ok", "clr_no", "bk_copy", "bk_move", "bk_swap", "bk_clear", "learn_pad", "learn_base", "net_test", "e_back", "e_clear", "register", "acc_forget",
                                          "deck_cue", "att_m", "att_p", "dec_m", "dec_p", "rel_m", "rel_p", "grp_m", "grp_p", "mode_t" };
     for (size_t i = 0; i < sizeof fixed / sizeof *fixed; i++) if (!strcmp(key, fixed[i])) return 1;
     return (key[0] == 'k' && key[1] == 'c' && isdigit((unsigned char)key[2])) || key_idx(key, "pq", NQUICK) || key_idx(key, "rt", ROWS) ||
@@ -2102,16 +2135,19 @@ static int get_param(void *inst, const char *key, char *b, int n) {
         return put(b, n, t);
     }
     if (!strcmp(key, "pmode_txt") || !strcmp(key, "rep_txt") || !strcmp(key, "undo_txt") || !strcmp(key, "ops_txt")) {
-        LOCK(); int md = G.pmode, rp = G.replace, nu = G.nundo, pe = G.pend, pb = G.pend_bk, sp = G.pad_sel, rc = G.rec_pad; unsigned long long sm = G.selmask; UNLOCK();
-        if (key[0] == 'p') snprintf(t, sizeof t, "MODE: %s", md == 0 ? "PLAY" : md == 1 ? "RECORD" : "SELECT");
+        LOCK(); int md = G.pmode, rp = G.replace, nu = G.nundo, pe = G.pend, pb = G.pend_bk, sp = G.pad_sel, rc = G.rec_pad, cl = G.clr, cf = G.clr_first; unsigned long long sm = G.selmask; UNLOCK();
+        if (key[0] == 'p') snprintf(t, sizeof t, "MODE: %s", md == 3 ? "AUTO" : md == 0 ? "PLAY" : md == 1 ? "RECORD" : "SELECT");
         else if (key[0] == 'r') snprintf(t, sizeof t, "REPLACE %s", rp ? "ON" : "OFF");
         else if (key[0] == 'u') snprintf(t, sizeof t, "UNDO %d", nu);
         else {
             int cnt = 0; for (int i = 0; i < NPADS; i++) if (sm >> i & 1) cnt++;
             if (atomic_load(&((inst_t *)inst)->ron)) snprintf(t, sizeof t, "RECORDING PAD %d ... let go to finish", rc + 1);
+            else if (cl == 1) snprintf(t, sizeof t, "CLEAR PADS: PRESS FIRST PAD");
+            else if (cl == 2) snprintf(t, sizeof t, "CLEAR PADS: PRESS LAST PAD");
+            else if (cl == 3) snprintf(t, sizeof t, "CLEAR PADS %d-%d? 16 ASSIGNMENTS", cf + 1, cf + NVIS);
             else if (pe) snprintf(t, sizeof t, "%s: tap the destination pad", pe == 1 ? "COPY" : pe == 2 ? "MOVE" : "SWAP");
             else if (pb) snprintf(t, sizeof t, "BANK %s: tap the destination bank", pb == 1 ? "COPY" : pb == 2 ? "MOVE" : "SWAP");
-            else if (md == 1) snprintf(t, sizeof t, "RECORD: hold pad %d while the player runs", sp + 1);
+            else if (md == 1 || md == 3) snprintf(t, sizeof t, "%s: hold pad %d while the player runs", md == 3 ? "AUTO (empty pad records)" : "RECORD", sp + 1);
             else if (cnt) snprintf(t, sizeof t, "%d pad%s marked (*)", cnt, cnt == 1 ? "" : "s");
             else snprintf(t, sizeof t, "Pad %d of 64", sp + 1);
         }
@@ -2217,7 +2253,7 @@ static int get_param(void *inst, const char *key, char *b, int n) {
         LOCK();
         unsigned fm = 0;
         for (int i = 0; i < 128; i++) fm = fm * 3u + (unsigned)(G.padmap[i] + 1);
-        unsigned h = G.rev * 2654435761u + (unsigned)G.pad_sel * 31u + (unsigned)G.learn * 7u + fm + (unsigned)atomic_load(&G.busy) * 101u + (unsigned)G.cat * 13u + (unsigned)G.shortonly * 17u + (unsigned)G.pv_valid * 19u + (unsigned)G.pv_kept * 23u + (unsigned)atomic_load(&dk->pitch) * 31u + (unsigned)atomic_load(&dk->prange) * 7u + (unsigned)atomic_load(&dk->klock) * 5u + (unsigned)G.pv_play * 3u + (unsigned)G.bank * 43u + (unsigned)G.pmode * 47u + (unsigned)G.pend * 53u + (unsigned)G.pend_bk * 59u + (unsigned)G.replace * 61u + (unsigned)G.nundo * 67u + (unsigned)(G.selmask * 2654435761ull >> 7) + (unsigned)(atomic_load(&((inst_t *)inst)->ron) * 71);
+        unsigned h = G.rev * 2654435761u + (unsigned)G.pad_sel * 31u + (unsigned)G.learn * 7u + fm + (unsigned)atomic_load(&G.busy) * 101u + (unsigned)G.cat * 13u + (unsigned)G.shortonly * 17u + (unsigned)G.pv_valid * 19u + (unsigned)G.pv_kept * 23u + (unsigned)atomic_load(&dk->pitch) * 31u + (unsigned)atomic_load(&dk->prange) * 7u + (unsigned)atomic_load(&dk->klock) * 5u + (unsigned)G.pv_play * 3u + (unsigned)G.bank * 43u + (unsigned)G.pmode * 47u + (unsigned)G.pend * 53u + (unsigned)G.pend_bk * 59u + (unsigned)G.replace * 61u + (unsigned)G.nundo * 67u + (unsigned)G.clr * 73u + (unsigned)(G.selmask * 2654435761ull >> 7) + (unsigned)(atomic_load(&((inst_t *)inst)->ron) * 71);
         UNLOCK();
         pthread_mutex_lock(&G.padmu);
         for (int i = 0; i < NPADS; i++) h = h * 31u + (G.pad[i].d ? (unsigned)G.pad[i].frames : 0u) + G.pc[i].att * 3u + G.pc[i].dec * 5u + G.pc[i].rel * 7u + G.pc[i].grp * 11u + G.pc[i].mode * 13u + (unsigned)(G.pc[i].a * 1000) * 17u + (unsigned)(G.pc[i].d * 1000) * 19u + (unsigned)(G.pc[i].s * 1000) * 23u + (unsigned)(G.pc[i].r * 1000) * 29u + (unsigned)(G.pc[i].st * 1000) * 37u + (unsigned)(G.pc[i].en * 1000) * 41u;
